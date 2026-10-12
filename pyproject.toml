@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "qa-cycle-detector"
+version = "0.1.0"
+description = "Forward uncertainty and Q-A cycle-mismatch features for hallucination detection"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "numpy>=1.24",
+  "sentence-transformers>=3.0",
+  "torch>=2.1",
+  "transformers>=4.45",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0"]
+
+[project.scripts]
+qa-cycle = "qa_cycle_detector.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["qa_cycle_detector*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
