@@ -142,3 +142,67 @@ The tests use fake generators and embeddings, so they do not download models:
 ```powershell
 pytest -q
 ```
+
+## Slurm experiment using the existing HaloScope environment
+
+The cluster pipeline reuses `$HOME/LLM_Haloscope/.venv`, the existing `HF_HOME`,
+and a small dependency overlay. It converts the saved PEFT TriviaQA predictions,
+extracts features in resumable atomic shards, trains the detector, and evaluates
+validation and test splits in one self-requeuing job.
+
+From the cloned repository, set the environment paths:
+
+```bash
+export HALOSCOPE_DIR="$HOME/LLM_Haloscope"
+export HALOSCOPE_PYTHON="$HALOSCOPE_DIR/.venv/bin/python"
+export CYCLE_OVERLAY="${SCRATCH:-$HOME}/qa-cycle-overlay"
+export PYTHONPATH="$PWD:$CYCLE_OVERLAY${PYTHONPATH:+:$PYTHONPATH}"
+
+# Reuse the exact cache used by HaloScope/PEFT. Do not choose a new directory.
+export HF_HOME=/absolute/path/to/existing/huggingface/cache
+
+# Existing PEFT output; `correct` is converted to `label = 1 - correct`.
+export SOURCE_PREDICTIONS=/absolute/path/to/outputs/llama2_7b_memory_probe/results/trivia_qa/predictions.jsonl
+```
+
+Run a 50-example smoke experiment first:
+
+```bash
+export CYCLE_RUN_ROOT="${SCRATCH:-$HOME}/qa-cycle-results/smoke-50"
+export MAX_EXAMPLES=50
+export SHARD_SIZE=5
+bash slurm/submit_pipeline.sh
+```
+
+Monitor it with the job ID printed by the submission script:
+
+```bash
+squeue -j JOB_ID
+tail -f slurm/logs/qa-cycle-JOB_ID.out
+```
+
+After the smoke run succeeds, submit a 500-example pilot into a new output
+directory:
+
+```bash
+export CYCLE_RUN_ROOT="${SCRATCH:-$HOME}/qa-cycle-results/pilot-500"
+export MAX_EXAMPLES=500
+export SHARD_SIZE=10
+bash slurm/submit_pipeline.sh
+```
+
+Use `MAX_EXAMPLES=0` for every eligible example. Always select a new
+`CYCLE_RUN_ROOT` when changing the sample count or model configuration. A timed
+out or preempted job requeues automatically; manually submitting the same run
+again also skips completed feature shards.
+
+Final outputs are:
+
+```text
+$CYCLE_RUN_ROOT/
+├── data/{train,validation,test}.jsonl
+├── features/{train,validation,test}/shard_*.jsonl
+├── models/{forward_only,cycle_only,competition_only,forward_cycle,full}.json
+├── validation_metrics.json
+└── test_metrics.json
+```

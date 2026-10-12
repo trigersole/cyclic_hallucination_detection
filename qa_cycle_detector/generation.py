@@ -24,28 +24,37 @@ class HuggingFaceGenerator:
     torch_dtype: str = "auto"
     trust_remote_code: bool = False
     seed: int = 42
+    local_files_only: bool = False
 
     def __post_init__(self) -> None:
         import torch
         from transformers import AutoModelForCausalLM, AutoTokenizer
 
         dtype = self.torch_dtype
-        torch.manual_seed(self.seed)
-        if torch.cuda.is_available():
-            torch.cuda.manual_seed_all(self.seed)
+        self.reseed(self.seed)
         if dtype != "auto":
             dtype = getattr(torch, dtype)
         self.tokenizer = AutoTokenizer.from_pretrained(
-            self.model_name, trust_remote_code=self.trust_remote_code
+            self.model_name,
+            trust_remote_code=self.trust_remote_code,
+            local_files_only=self.local_files_only,
         )
         self.model = AutoModelForCausalLM.from_pretrained(
             self.model_name,
             device_map=self.device_map,
             torch_dtype=dtype,
             trust_remote_code=self.trust_remote_code,
+            local_files_only=self.local_files_only,
         )
         if self.tokenizer.pad_token_id is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
+
+    def reseed(self, seed: int) -> None:
+        import torch
+
+        torch.manual_seed(seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(seed)
 
     def _format(self, prompt: str) -> str:
         messages = [{"role": "user", "content": prompt}]

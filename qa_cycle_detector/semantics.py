@@ -15,11 +15,16 @@ class SemanticEncoder(Protocol):
 class SentenceTransformerEncoder:
     model_name: str = "sentence-transformers/all-mpnet-base-v2"
     device: str | None = None
+    local_files_only: bool = False
 
     def __post_init__(self) -> None:
         from sentence_transformers import SentenceTransformer
 
-        self.model = SentenceTransformer(self.model_name, device=self.device)
+        self.model = SentenceTransformer(
+            self.model_name,
+            device=self.device,
+            local_files_only=self.local_files_only,
+        )
 
     def encode(self, texts: Sequence[str]) -> np.ndarray:
         return np.asarray(

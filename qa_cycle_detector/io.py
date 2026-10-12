@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -8,8 +9,14 @@ from .features import CycleFeatures
 
 
 def read_jsonl(path: str | Path) -> list[dict[str, Any]]:
+    path = Path(path)
+    if path.is_dir():
+        shard_paths = sorted(path.glob("shard_*.jsonl"))
+        if not shard_paths:
+            raise ValueError(f"no shard_*.jsonl files found in {path}")
+        return [row for shard in shard_paths for row in read_jsonl(shard)]
     rows: list[dict[str, Any]] = []
-    with Path(path).open(encoding="utf-8") as handle:
+    with path.open(encoding="utf-8") as handle:
         for line_number, line in enumerate(handle, start=1):
             if not line.strip():
                 continue
@@ -29,6 +36,14 @@ def write_jsonl(rows: Iterable[dict[str, Any]], path: str | Path) -> None:
     with path.open("w", encoding="utf-8") as handle:
         for row in rows:
             handle.write(json.dumps(row, ensure_ascii=False) + "\n")
+
+
+def atomic_write_jsonl(rows: Iterable[dict[str, Any]], path: str | Path) -> None:
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    write_jsonl(rows, temporary)
+    os.replace(temporary, path)
 
 
 def features_from_row(row: dict[str, Any]) -> CycleFeatures:

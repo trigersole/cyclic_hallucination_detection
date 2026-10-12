@@ -1,14 +1,16 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
+import os
 from pathlib import Path
 from typing import Any
 
 from .config import DetectorConfig, GenerationConfig
 from .features import CycleFeatureExtractor
 from .generation import HuggingFaceGenerator
-from .io import features_from_row, read_jsonl, write_jsonl
+from .io import atomic_write_jsonl, features_from_row, read_jsonl, write_jsonl
 from .model import HallucinationClassifier, evaluate, save_metrics
 from .semantics import SentenceTransformerEncoder
 
@@ -34,8 +36,13 @@ def _extractor(args: argparse.Namespace) -> CycleFeatureExtractor:
         torch_dtype=args.torch_dtype,
         trust_remote_code=args.trust_remote_code,
         seed=args.seed,
+        local_files_only=args.local_files_only,
     )
-    encoder = SentenceTransformerEncoder(args.embedding_model, device=args.embedding_device)
+    encoder = SentenceTransformerEncoder(
+        args.embedding_model,
+        device=args.embedding_device,
+        local_files_only=args.local_files_only,
+    )
     return CycleFeatureExtractor(generator, encoder, config)
 
 
@@ -56,6 +63,106 @@ def _extract(args: argparse.Namespace) -> None:
         output_rows.append(output)
         print(f"extracted {index}", flush=True)
     write_jsonl(output_rows, args.output)
+
+
+def _extract_one(
+    extractor: CycleFeatureExtractor,
+    row: dict[str, Any],
+    index: int,
+    keep_samples: bool,
+) -> dict[str, Any]:
+    try:
+        question = str(row["question"])
+        answer = str(row["answer"])
+    except KeyError as error:
+        raise ValueError(f"row {index} needs question and answer fields") from error
+    features, details = extractor.extract(question, answer)
+    output = dict(row)
+    output["features"] = features.to_dict()
+    if keep_samples:
+        output["samples"] = details
+    return output
+
+
+def _sha256(path: str | Path) -> str:
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as handle:
+        for block in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def _atomic_json(payload: dict[str, Any], path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+    os.replace(temporary, path)
+
+
+def _extract_sharded(args: argparse.Namespace) -> None:
+    if args.shard_size < 1:
+        raise ValueError("shard-size must be at least 1")
+    rows = read_jsonl(args.input)
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    signature = {
+        "schema_version": 1,
+        "input_sha256": _sha256(args.input),
+        "num_rows": len(rows),
+        "shard_size": args.shard_size,
+        "generator_model": args.generator_model,
+        "embedding_model": args.embedding_model,
+        "forward_samples": args.forward_samples,
+        "inverse_samples": args.inverse_samples,
+        "forward_temperature": args.forward_temperature,
+        "inverse_temperature": args.inverse_temperature,
+        "threshold": args.threshold,
+        "smoothing": args.smoothing,
+        "seed": args.seed,
+        "keep_samples": args.keep_samples,
+    }
+    manifest = output_dir / "_RUN.json"
+    if manifest.exists():
+        existing = json.loads(manifest.read_text(encoding="utf-8"))
+        if existing != signature:
+            raise RuntimeError(
+                f"existing extraction configuration differs in {output_dir}; "
+                "use a new output directory"
+            )
+    else:
+        _atomic_json(signature, manifest)
+
+    shards = [
+        (start, rows[start : start + args.shard_size])
+        for start in range(0, len(rows), args.shard_size)
+    ]
+    pending = [
+        (number, start, shard)
+        for number, (start, shard) in enumerate(shards)
+        if not (output_dir / f"shard_{number:05d}.jsonl").exists()
+    ]
+    if not pending:
+        _atomic_json({"complete": True, "num_rows": len(rows)}, output_dir / "_SUCCESS.json")
+        print(f"all {len(shards)} shards already complete")
+        return
+
+    extractor = _extractor(args)
+    for number, start, shard in pending:
+        reseed = getattr(extractor.generator, "reseed", None)
+        if reseed is not None:
+            reseed(args.seed + number)
+        output_rows = [
+            _extract_one(extractor, row, start + offset + 1, args.keep_samples)
+            for offset, row in enumerate(shard)
+        ]
+        target = output_dir / f"shard_{number:05d}.jsonl"
+        atomic_write_jsonl(output_rows, target)
+        print(
+            f"completed shard {number + 1}/{len(shards)} "
+            f"({start + len(shard)}/{len(rows)} rows)",
+            flush=True,
+        )
+    _atomic_json({"complete": True, "num_rows": len(rows)}, output_dir / "_SUCCESS.json")
 
 
 def _train(args: argparse.Namespace) -> None:
@@ -101,6 +208,7 @@ def _generation_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--embedding-device")
     parser.add_argument("--torch-dtype", default="auto")
     parser.add_argument("--trust-remote-code", action="store_true")
+    parser.add_argument("--local-files-only", action="store_true")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--forward-samples", type=int, default=10)
     parser.add_argument("--inverse-samples", type=int, default=10)
@@ -122,6 +230,16 @@ def build_parser() -> argparse.ArgumentParser:
     extract.add_argument("--keep-samples", action="store_true")
     _generation_arguments(extract)
     extract.set_defaults(handler=_extract)
+
+    sharded = subparsers.add_parser(
+        "extract-sharded", help="resumable atomic feature extraction"
+    )
+    sharded.add_argument("--input", required=True)
+    sharded.add_argument("--output-dir", required=True)
+    sharded.add_argument("--shard-size", type=int, default=10)
+    sharded.add_argument("--keep-samples", action="store_true")
+    _generation_arguments(sharded)
+    sharded.set_defaults(handler=_extract_sharded)
 
     train = subparsers.add_parser("train", help="train logistic regression")
     train.add_argument("--input", required=True)

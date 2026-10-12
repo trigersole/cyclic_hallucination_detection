@@ -19,8 +19,20 @@ def test_classifier_fits_scores_and_round_trips(tmp_path) -> None:
     metrics = evaluate(labels, scores)
     assert metrics["auroc"] == 1.0
     assert metrics["auprc"] == 1.0
+    assert metrics["aurc"] >= 0.0
 
     path = tmp_path / "detector.json"
     classifier.save(path)
     loaded = HallucinationClassifier.load(path)
     assert loaded.predict_proba(features).tolist() == scores.tolist()
+
+
+def test_feature_subset_is_persisted(tmp_path) -> None:
+    features = [row(0.0, 2.0, 1.0), row(0.1, 1.0, -1.0), row(1.0, 0.1, 0.0), row(1.1, 0.2, 0.0)]
+    classifier = HallucinationClassifier.fit(
+        features, [0, 0, 1, 1], feature_names=["forward_entropy"]
+    )
+    path = tmp_path / "forward.json"
+    classifier.save(path)
+    loaded = HallucinationClassifier.load(path)
+    assert loaded.feature_names == ["forward_entropy"]

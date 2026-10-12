@@ -10,13 +10,28 @@ import numpy as np
 from .features import CycleFeatures
 
 
-FEATURE_NAMES = ["forward_entropy", "cycle_surprisal", "competing_margin"]
+DEFAULT_FEATURE_NAMES = ["forward_entropy", "cycle_surprisal", "competing_margin"]
+AVAILABLE_FEATURE_NAMES = {
+    "forward_entropy",
+    "cycle_surprisal",
+    "competing_margin",
+    "inverse_entropy",
+    "original_question_support",
+}
 
 
-def feature_matrix(features: Sequence[CycleFeatures]) -> np.ndarray:
+def feature_matrix(
+    features: Sequence[CycleFeatures], feature_names: Sequence[str] = DEFAULT_FEATURE_NAMES
+) -> np.ndarray:
     if not features:
         raise ValueError("at least one feature row is required")
-    return np.asarray([row.model_vector for row in features], dtype=np.float64)
+    names = list(feature_names)
+    if not names or not set(names) <= AVAILABLE_FEATURE_NAMES:
+        raise ValueError(f"invalid feature names: {names}")
+    return np.asarray(
+        [[float(getattr(row, name)) for name in names] for row in features],
+        dtype=np.float64,
+    )
 
 
 @dataclass
@@ -27,6 +42,7 @@ class HallucinationClassifier:
     bias: float
     mean: np.ndarray
     scale: np.ndarray
+    feature_names: list[str]
 
     @staticmethod
     def _sigmoid(values: np.ndarray) -> np.ndarray:
@@ -43,6 +59,7 @@ class HallucinationClassifier:
         learning_rate: float = 0.05,
         max_iter: int = 5000,
         l2: float = 1e-3,
+        feature_names: Sequence[str] = DEFAULT_FEATURE_NAMES,
     ) -> "HallucinationClassifier":
         del random_state  # Optimization is deliberately deterministic.
         y = np.asarray(labels, dtype=np.int64)
@@ -51,7 +68,8 @@ class HallucinationClassifier:
         if set(np.unique(y)) != {0, 1}:
             raise ValueError("training labels must contain both 0 and 1")
 
-        x = feature_matrix(features)
+        names = list(feature_names)
+        x = feature_matrix(features, names)
         mean = x.mean(axis=0)
         scale = x.std(axis=0)
         scale[scale < 1e-12] = 1.0
@@ -78,18 +96,24 @@ class HallucinationClassifier:
             bias -= learning_rate * bias_gradient
             if np.linalg.norm(step) < 1e-9 and abs(bias_gradient) < 1e-9:
                 break
-        return cls(weights=weights, bias=bias, mean=mean, scale=scale)
+        return cls(
+            weights=weights,
+            bias=bias,
+            mean=mean,
+            scale=scale,
+            feature_names=names,
+        )
 
     def predict_proba(self, features: Sequence[CycleFeatures]) -> np.ndarray:
-        x = (feature_matrix(features) - self.mean) / self.scale
+        x = (feature_matrix(features, self.feature_names) - self.mean) / self.scale
         return self._sigmoid(x @ self.weights + self.bias)
 
     def save(self, path: str | Path) -> None:
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
         payload = {
-            "version": 1,
-            "feature_names": FEATURE_NAMES,
+            "version": 2,
+            "feature_names": self.feature_names,
             "weights": self.weights.tolist(),
             "bias": self.bias,
             "mean": self.mean.tolist(),
@@ -100,13 +124,15 @@ class HallucinationClassifier:
     @classmethod
     def load(cls, path: str | Path) -> "HallucinationClassifier":
         payload = json.loads(Path(path).read_text(encoding="utf-8"))
-        if payload.get("feature_names") != FEATURE_NAMES:
+        names = payload.get("feature_names")
+        if not isinstance(names, list) or not set(names) <= AVAILABLE_FEATURE_NAMES:
             raise ValueError("model feature schema is incompatible")
         return cls(
             weights=np.asarray(payload["weights"], dtype=np.float64),
             bias=float(payload["bias"]),
             mean=np.asarray(payload["mean"], dtype=np.float64),
             scale=np.asarray(payload["scale"], dtype=np.float64),
+            feature_names=names,
         )
 
 
@@ -149,9 +175,12 @@ def evaluate(labels: Sequence[int], scores: Sequence[float]) -> dict[str, float]
         raise ValueError("labels and scores must have equal length")
     if set(np.unique(y)) != {0, 1}:
         raise ValueError("evaluation requires both label classes")
+    accepted_order = np.argsort(probabilities, kind="mergesort")
+    selective_risk = np.cumsum(y[accepted_order]) / np.arange(1, len(y) + 1)
     return {
         "auroc": _auroc(y, probabilities),
         "auprc": _average_precision(y, probabilities),
+        "aurc": float(selective_risk.mean()),
     }
 
 
