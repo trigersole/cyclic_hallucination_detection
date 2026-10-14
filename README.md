@@ -2,7 +2,7 @@
 
 This repository is a runnable pilot of the reference-free method agreed in the
 project discussion. For an original question `Q` and initial answer `A0`, it
-estimates three signals:
+estimates four signals:
 
 1. **Forward semantic entropy**: sample answers from `p(A | Q)`, cluster them,
    and measure how dispersed the answer distribution is.
@@ -11,6 +11,9 @@ estimates three signals:
    `-log(S_Q)`.
 3. **Competing-question margin**: compare the strongest alternative question
    cluster with the original-question support.
+4. **InterrogateLLM similarity**: average the continuous cosine similarities
+   between the original and reconstructed questions. Its risk form is
+   `1 - mean_similarity`, so larger values indicate greater mismatch.
 
 A calibrated logistic regression learns the final hallucination probability:
 
@@ -21,6 +24,9 @@ sigmoid(b + w1 * H_forward + w2 * cycle_surprisal + w3 * competing_margin)
 Raw inverse semantic entropy is also recorded for analysis, but it is not part
 of the default classifier because it measures answer ambiguity and need not
 increase with hallucination risk.
+
+The ablation runner reports both the raw InterrogateLLM-style risk and a
+logistic-calibrated version, as well as its combination with forward entropy.
 
 ## Important scope
 
@@ -123,6 +129,17 @@ R_Q = log(p_alt / S_Q)
 Positive `R_Q` means an alternative question is more strongly supported than
 the original. Semantic entropy uses natural logarithms.
 
+The matched InterrogateLLM baseline uses the same reconstructed questions and
+embedding model as the cycle detector:
+
+```text
+I_similarity = mean_k cosine(E(Q), E(Q'_k))
+I_risk = 1 - I_similarity
+```
+
+Using identical samples isolates the effect of continuous mean similarity from
+the thresholded support used by cycle surprisal.
+
 ## Experimental cautions
 
 - Tune the equivalence threshold only on training/validation data.
@@ -202,7 +219,54 @@ Final outputs are:
 $CYCLE_RUN_ROOT/
 ├── data/{train,validation,test}.jsonl
 ├── features/{train,validation,test}/shard_*.jsonl
-├── models/{forward_only,cycle_only,competition_only,forward_cycle,full}.json
+├── models/{forward_only,cycle_only,competition_only,interrogate_calibrated,
+│          forward_cycle,forward_interrogate,full}.json
 ├── validation_metrics.json
 └── test_metrics.json
+```
+
+The metrics files also contain `interrogate_raw`, which needs no trained model.
+New extraction runs calculate these features automatically.
+
+## Add InterrogateLLM scores to an existing completed run
+
+Runs created before the InterrogateLLM feature was added can reuse their saved
+inverse-question samples. This step runs only the embedding model and does not
+generate any new answers or questions:
+
+```bash
+python -m scripts.backfill_interrogate \
+  --run-root "$CYCLE_RUN_ROOT" \
+  --embedding-model "$EMBEDDING_MODEL" \
+  --device cpu \
+  --local-files-only
+```
+
+The original shards remain unchanged. Augmented copies are written under
+`$CYCLE_RUN_ROOT/features_interrogate`. Train and evaluate the expanded
+ablation set with:
+
+```bash
+python -m scripts.run_ablations train \
+  --input "$CYCLE_RUN_ROOT/features_interrogate/train" \
+  --output-dir "$CYCLE_RUN_ROOT/models_interrogate"
+
+python -m scripts.run_ablations evaluate \
+  --input "$CYCLE_RUN_ROOT/features_interrogate/validation" \
+  --model-dir "$CYCLE_RUN_ROOT/models_interrogate" \
+  --output "$CYCLE_RUN_ROOT/validation_metrics_interrogate.json"
+
+python -m scripts.run_ablations evaluate \
+  --input "$CYCLE_RUN_ROOT/features_interrogate/test" \
+  --model-dir "$CYCLE_RUN_ROOT/models_interrogate" \
+  --output "$CYCLE_RUN_ROOT/test_metrics_interrogate.json"
+```
+
+For the full dataset on the configured cluster, run the resumable GPU version:
+
+```bash
+sbatch --export=ALL \
+  --output=slurm/logs/interrogate-%j.out \
+  --error=slurm/logs/interrogate-%j.err \
+  slurm/interrogate_comparison.sbatch
 ```

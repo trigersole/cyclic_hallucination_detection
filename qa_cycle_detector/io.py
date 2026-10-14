@@ -56,5 +56,8 @@ def features_from_row(row: dict[str, Any]) -> CycleFeatures:
         inverse_entropy=float(payload.get("inverse_entropy", 0.0)),
         forward_cluster_count=int(payload.get("forward_cluster_count", 0)),
         inverse_cluster_count=int(payload.get("inverse_cluster_count", 0)),
+        interrogate_similarity=float(
+            payload.get("interrogate_similarity", float("nan"))
+        ),
     )
 

@@ -17,6 +17,8 @@ AVAILABLE_FEATURE_NAMES = {
     "competing_margin",
     "inverse_entropy",
     "original_question_support",
+    "interrogate_similarity",
+    "interrogate_risk",
 }
 
 
@@ -28,10 +30,16 @@ def feature_matrix(
     names = list(feature_names)
     if not names or not set(names) <= AVAILABLE_FEATURE_NAMES:
         raise ValueError(f"invalid feature names: {names}")
-    return np.asarray(
+    matrix = np.asarray(
         [[float(getattr(row, name)) for name in names] for row in features],
         dtype=np.float64,
     )
+    if not np.isfinite(matrix).all():
+        raise ValueError(
+            "selected features contain missing or non-finite values; "
+            "backfill InterrogateLLM features for legacy extraction outputs"
+        )
+    return matrix
 
 
 @dataclass

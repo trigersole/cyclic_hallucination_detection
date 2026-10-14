@@ -6,14 +6,16 @@ import json
 from pathlib import Path
 
 from qa_cycle_detector.io import features_from_row, read_jsonl
-from qa_cycle_detector.model import HallucinationClassifier, evaluate
+from qa_cycle_detector.model import HallucinationClassifier, evaluate, feature_matrix
 
 
 FEATURE_SETS = {
     "forward_only": ["forward_entropy"],
     "cycle_only": ["cycle_surprisal"],
     "competition_only": ["competing_margin"],
+    "interrogate_calibrated": ["interrogate_risk"],
     "forward_cycle": ["forward_entropy", "cycle_surprisal"],
+    "forward_interrogate": ["forward_entropy", "interrogate_risk"],
     "full": ["forward_entropy", "cycle_surprisal", "competing_margin"],
 }
 
@@ -26,7 +28,11 @@ def load(path: str):
 def train(input_path: str, output_dir: Path) -> None:
     features, labels = load(input_path)
     output_dir.mkdir(parents=True, exist_ok=True)
-    metrics = {}
+    metrics = {
+        "interrogate_raw": evaluate(
+            labels, feature_matrix(features, ["interrogate_risk"])[:, 0]
+        )
+    }
     for name, feature_names in FEATURE_SETS.items():
         classifier = HallucinationClassifier.fit(
             features, labels, feature_names=feature_names
@@ -41,7 +47,11 @@ def train(input_path: str, output_dir: Path) -> None:
 
 def evaluate_all(input_path: str, model_dir: Path, output: Path) -> None:
     features, labels = load(input_path)
-    metrics = {}
+    metrics = {
+        "interrogate_raw": evaluate(
+            labels, feature_matrix(features, ["interrogate_risk"])[:, 0]
+        )
+    }
     for name in FEATURE_SETS:
         classifier = HallucinationClassifier.load(model_dir / f"{name}.json")
         metrics[name] = evaluate(labels, classifier.predict_proba(features))

@@ -106,7 +106,7 @@ def _extract_sharded(args: argparse.Namespace) -> None:
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     signature = {
-        "schema_version": 1,
+        "schema_version": 2,
         "input_sha256": _sha256(args.input),
         "num_rows": len(rows),
         "shard_size": args.shard_size,

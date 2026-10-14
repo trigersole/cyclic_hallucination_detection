@@ -86,7 +86,16 @@ def equivalent_to_target(
     target_embedding: np.ndarray,
     threshold: float,
 ) -> np.ndarray:
+    return similarities_to_target(sample_embeddings, target_embedding) >= threshold
+
+
+def similarities_to_target(
+    sample_embeddings: np.ndarray,
+    target_embedding: np.ndarray,
+) -> np.ndarray:
+    """Return cosine similarity from every sample to one target embedding."""
+
     samples = _normalized(sample_embeddings)
     target = _normalized(np.asarray(target_embedding).reshape(1, -1))[0]
-    return (samples @ target) >= threshold
+    return samples @ target
 

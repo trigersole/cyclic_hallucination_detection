@@ -59,6 +59,12 @@ def test_cycle_features_capture_dominant_alternative() -> None:
     assert features.forward_entropy == pytest.approx(np.log(2))
     assert features.original_question_support == pytest.approx(1.5 / 5.0)
     assert features.competing_margin > 0
+    assert features.interrogate_similarity == pytest.approx(
+        np.mean([0.0, 0.01 / np.sqrt(0.99**2 + 0.01**2), 0.0, 1.0])
+    )
+    assert features.interrogate_risk == pytest.approx(
+        1.0 - features.interrogate_similarity
+    )
     assert details["matches_original"] == [False, False, False, True]
 
 

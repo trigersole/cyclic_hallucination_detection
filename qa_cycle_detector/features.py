@@ -8,7 +8,7 @@ import numpy as np
 
 from .config import DetectorConfig
 from .generation import TextGenerator, answer_prompt, inverse_prompt
-from .semantics import SemanticEncoder, cluster_embeddings, equivalent_to_target
+from .semantics import SemanticEncoder, cluster_embeddings, similarities_to_target
 
 
 def semantic_entropy(cluster_sizes: list[int]) -> float:
@@ -28,6 +28,13 @@ class CycleFeatures:
     inverse_entropy: float
     forward_cluster_count: int
     inverse_cluster_count: int
+    interrogate_similarity: float = float("nan")
+
+    @property
+    def interrogate_risk(self) -> float:
+        """InterrogateLLM-style risk; larger values indicate more mismatch."""
+
+        return 1.0 - self.interrogate_similarity
 
     @property
     def model_vector(self) -> list[float]:
@@ -75,11 +82,11 @@ class CycleFeatureExtractor:
         h_inverse = semantic_entropy([len(cluster) for cluster in inverse_clusters])
 
         original_embedding = self.encoder.encode([question])[0]
-        matching = equivalent_to_target(
-            inverse_embeddings,
-            original_embedding,
-            self.config.equivalence_threshold,
+        inverse_similarities = similarities_to_target(
+            inverse_embeddings, original_embedding
         )
+        interrogate_similarity = float(inverse_similarities.mean())
+        matching = inverse_similarities >= self.config.equivalence_threshold
         matching_count = int(matching.sum())
 
         # If Q matches no observed cluster, smoothing includes Q as an unobserved
@@ -109,12 +116,14 @@ class CycleFeatureExtractor:
             inverse_entropy=h_inverse,
             forward_cluster_count=len(forward_clusters),
             inverse_cluster_count=len(inverse_clusters),
+            interrogate_similarity=interrogate_similarity,
         )
         details = {
             "forward_answers": forward_answers,
             "forward_clusters": forward_clusters,
             "reconstructed_questions": reconstructed_questions,
             "inverse_clusters": inverse_clusters,
+            "similarities_to_original": inverse_similarities.tolist(),
             "matches_original": matching.tolist(),
         }
         return features, details
