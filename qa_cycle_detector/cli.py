@@ -27,6 +27,12 @@ def _extractor(args: argparse.Namespace) -> CycleFeatureExtractor:
             temperature=args.inverse_temperature,
             max_new_tokens=args.question_tokens,
         ),
+        canonicalization=GenerationConfig(
+            samples=1,
+            temperature=args.canonicalization_temperature,
+            max_new_tokens=args.canonicalization_tokens,
+        ),
+        answer_format=args.answer_format,
         equivalence_threshold=args.threshold,
         smoothing=args.smoothing,
     )
@@ -106,7 +112,7 @@ def _extract_sharded(args: argparse.Namespace) -> None:
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     signature = {
-        "schema_version": 2,
+        "schema_version": 3,
         "input_sha256": _sha256(args.input),
         "num_rows": len(rows),
         "shard_size": args.shard_size,
@@ -116,6 +122,9 @@ def _extract_sharded(args: argparse.Namespace) -> None:
         "inverse_samples": args.inverse_samples,
         "forward_temperature": args.forward_temperature,
         "inverse_temperature": args.inverse_temperature,
+        "canonicalization_temperature": args.canonicalization_temperature,
+        "canonicalization_tokens": args.canonicalization_tokens,
+        "answer_format": args.answer_format,
         "threshold": args.threshold,
         "smoothing": args.smoothing,
         "seed": args.seed,
@@ -214,6 +223,11 @@ def _generation_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--inverse-samples", type=int, default=10)
     parser.add_argument("--forward-temperature", type=float, default=0.8)
     parser.add_argument("--inverse-temperature", type=float, default=0.8)
+    parser.add_argument("--canonicalization-temperature", type=float, default=0.2)
+    parser.add_argument("--canonicalization-tokens", type=int, default=64)
+    parser.add_argument(
+        "--answer-format", choices=("short", "structured"), default="short"
+    )
     parser.add_argument("--answer-tokens", type=int, default=48)
     parser.add_argument("--question-tokens", type=int, default=64)
     parser.add_argument("--threshold", type=float, default=0.82)

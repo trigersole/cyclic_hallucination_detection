@@ -7,7 +7,13 @@ from typing import Any
 import numpy as np
 
 from .config import DetectorConfig
-from .generation import TextGenerator, answer_prompt, inverse_prompt
+from .generation import (
+    TextGenerator,
+    answer_prompt,
+    canonicalization_prompt,
+    inverse_prompt,
+    parse_structured_answer,
+)
 from .semantics import SemanticEncoder, cluster_embeddings, similarities_to_target
 
 
@@ -61,10 +67,29 @@ class CycleFeatureExtractor:
             raise ValueError("question and initial_answer must be non-empty")
 
         forward_answers = self.generator.generate(
-            [answer_prompt(question)], self.config.forward
+            [answer_prompt(question, self.config.answer_format)], self.config.forward
         )[0]
+
+        inverse_answer = initial_answer
+        canonicalization: dict[str, Any] | None = None
+        if self.config.answer_format == "structured":
+            raw_canonicalization = self.generator.generate(
+                [canonicalization_prompt(question, initial_answer)],
+                self.config.canonicalization,
+            )[0][0]
+            canonicalization = parse_structured_answer(
+                raw_canonicalization, expected_answer=initial_answer
+            )
+            if canonicalization["valid"]:
+                inverse_answer = " || ".join(
+                    [
+                        canonicalization["value"],
+                        canonicalization["type"],
+                        canonicalization["qualifier"],
+                    ]
+                )
         reconstructed_questions = self.generator.generate(
-            [inverse_prompt(initial_answer)], self.config.inverse
+            [inverse_prompt(inverse_answer)], self.config.inverse
         )[0]
         if not forward_answers or not reconstructed_questions:
             raise RuntimeError("generator returned no samples")
@@ -120,6 +145,16 @@ class CycleFeatureExtractor:
         )
         details = {
             "forward_answers": forward_answers,
+            "forward_format_valid": [
+                parse_structured_answer(answer)["valid"]
+                for answer in forward_answers
+            ]
+            if self.config.answer_format == "structured"
+            else None,
+            "answer_format": self.config.answer_format,
+            "original_answer": initial_answer,
+            "inverse_answer": inverse_answer,
+            "canonicalization": canonicalization,
             "forward_clusters": forward_clusters,
             "reconstructed_questions": reconstructed_questions,
             "inverse_clusters": inverse_clusters,

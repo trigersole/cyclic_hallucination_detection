@@ -22,6 +22,7 @@ EMBEDDING_MODEL=${EMBEDDING_MODEL:-sentence-transformers/all-mpnet-base-v2}
 MAX_EXAMPLES=${MAX_EXAMPLES:-500}
 SHARD_SIZE=${SHARD_SIZE:-10}
 LOCAL_FILES_ONLY=${LOCAL_FILES_ONLY:-0}
+ANSWER_FORMAT=${ANSWER_FORMAT:-short}
 TOTAL_STEPS=7
 
 cd "${SLURM_SUBMIT_DIR}"
@@ -82,6 +83,9 @@ GENERATION_ARGS=(
   --inverse-samples 10
   --forward-temperature 0.8
   --inverse-temperature 0.8
+  --canonicalization-temperature 0.2
+  --canonicalization-tokens 64
+  --answer-format "$ANSWER_FORMAT"
   --threshold 0.82
   --smoothing 0.5
   --seed 42

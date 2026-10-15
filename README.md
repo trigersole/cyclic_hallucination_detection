@@ -104,6 +104,51 @@ Useful experiment controls include `--forward-samples`, `--inverse-samples`,
 `--forward-temperature`, `--inverse-temperature`, and `--threshold`. Run
 `qa-cycle <command> --help` for all options.
 
+## Structured-answer prompt experiment
+
+The default `short` condition is unchanged. An optional `structured` condition
+tests whether a minimally disambiguated answer changes inverse consistency:
+
+```text
+ANSWER || TYPE || QUALIFIER
+```
+
+The canonicalization step is required to copy the supplied answer value exactly.
+If parsing fails, the type is invalid, the qualifier is too long, or the answer
+value changes, extraction falls back to the original answer. Raw output, failure
+reason, forward-format compliance, and the exact answer passed to inverse
+generation are saved under `samples`.
+
+This differs from the authors' InterrogateLLM prompt. Their implementation uses
+task-specific few-shot `Question: ... / Answer: ...` demonstrations for forward
+generation, reverses them to `Answer: ... / Question: ...` demonstrations, and
+then requests only the question corresponding to the final answer. See the
+[authors' prompt construction](https://github.com/yakir-yehuda/InterrogateLLM/blob/main/models/interrogatellm.py#L43-L79).
+
+Run a separate 200-example pilot rather than overwriting the short-answer run:
+
+```bash
+export CYCLE_RUN_ROOT="${SCRATCH:-$HOME}/qa-cycle-results/structured-pilot-200"
+export MAX_EXAMPLES=200
+export SHARD_SIZE=10
+export ANSWER_FORMAT=structured
+
+bash slurm/submit_pipeline.sh
+```
+
+After completion, summarize prompt compliance and possible qualifier leakage:
+
+```bash
+python -m scripts.analyze_answer_format \
+  --run-root "$CYCLE_RUN_ROOT" \
+  --output "$CYCLE_RUN_ROOT/answer_format_report.json"
+```
+
+`possible_leakage_rate_at_0.5` is a lexical diagnostic, not a factuality judge:
+it flags valid qualifiers for which at least half of the non-stopword qualifier
+tokens also occur in the question after excluding answer tokens. Manually audit
+flagged and unflagged examples before drawing a causal conclusion.
+
 ## Mathematical details
 
 Let inverse samples form semantic clusters with `K` total samples. Samples

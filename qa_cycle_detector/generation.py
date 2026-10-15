@@ -1,7 +1,8 @@
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
-from typing import Protocol, Sequence
+from typing import Any, Protocol, Sequence
 
 from .config import GenerationConfig
 
@@ -97,10 +98,96 @@ class HuggingFaceGenerator:
         return decoded
 
 
-def answer_prompt(question: str) -> str:
+ANSWER_TYPES = {
+    "PERSON",
+    "LOCATION",
+    "ORGANIZATION",
+    "DATE",
+    "NUMBER",
+    "WORK",
+    "EVENT",
+    "OTHER",
+}
+
+
+def _normalized_value(text: str) -> str:
+    return " ".join(re.findall(r"[\w]+", text.casefold(), flags=re.UNICODE))
+
+
+def parse_structured_answer(
+    text: str, expected_answer: str | None = None
+) -> dict[str, Any]:
+    """Parse ``ANSWER || TYPE || QUALIFIER`` without silently changing A0."""
+
+    result: dict[str, Any] = {
+        "valid": False,
+        "raw": text,
+        "value": "",
+        "type": "",
+        "qualifier": "",
+        "failure_reason": "missing_delimiters",
+    }
+    candidates = [line.strip(" `\t") for line in text.splitlines() if "||" in line]
+    if not candidates:
+        return result
+    for candidate in candidates:
+        parts = [part.strip() for part in candidate.split("||")]
+        if len(parts) != 3 or not all(parts):
+            result["failure_reason"] = "expected_three_nonempty_fields"
+            continue
+        value, answer_type, qualifier = parts
+        value = re.sub(
+            r"^(?:answer|value)\s*:\s*", "", value, flags=re.IGNORECASE
+        )
+        answer_type = answer_type.upper()
+        result.update(value=value, type=answer_type, qualifier=qualifier)
+        if answer_type not in ANSWER_TYPES:
+            result["failure_reason"] = "invalid_type"
+            continue
+        if expected_answer is not None and _normalized_value(
+            value
+        ) != _normalized_value(expected_answer):
+            result["failure_reason"] = "answer_value_changed"
+            continue
+        if len(qualifier.split()) > 8:
+            result["failure_reason"] = "qualifier_too_long"
+            continue
+        result["valid"] = True
+        result["failure_reason"] = None
+        break
+    return result
+
+
+def answer_prompt(question: str, answer_format: str = "short") -> str:
+    if answer_format == "structured":
+        return (
+            "Answer the factual question using exactly one line in this format:\n"
+            "ANSWER || TYPE || QUALIFIER\n\n"
+            "TYPE must be one of PERSON, LOCATION, ORGANIZATION, DATE, NUMBER, "
+            "WORK, EVENT, OTHER. QUALIFIER must contain at most eight words and "
+            "identify the answer itself. Do not explain, repeat, or paraphrase the "
+            "question.\n\n"
+            f"Question: {question}\nAnswer:"
+        )
+    if answer_format != "short":
+        raise ValueError("answer_format must be 'short' or 'structured'")
     return (
         "Answer the factual question directly and concisely. Return only the answer, "
         f"without commentary.\n\nQuestion: {question}\nAnswer:"
+    )
+
+
+def canonicalization_prompt(question: str, answer: str) -> str:
+    """Ask for a structured representation while requiring A0 to stay unchanged."""
+
+    return (
+        "Reformat the supplied answer using exactly one line:\n"
+        "ANSWER || TYPE || QUALIFIER\n\n"
+        "Copy ANSWER exactly from SUPPLIED ANSWER. TYPE must be one of PERSON, "
+        "LOCATION, ORGANIZATION, DATE, NUMBER, WORK, EVENT, OTHER. QUALIFIER must "
+        "contain at most eight words and identify the answer itself. Do not correct "
+        "the answer. Do not explain, repeat, or paraphrase the question.\n\n"
+        f"Question: {question}\nSUPPLIED ANSWER: {answer}\nFormatted answer:"
     )
 
 

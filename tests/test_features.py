@@ -5,13 +5,16 @@ import pytest
 
 from qa_cycle_detector.config import DetectorConfig, GenerationConfig
 from qa_cycle_detector.features import CycleFeatureExtractor, semantic_entropy
+from qa_cycle_detector.generation import parse_structured_answer
 
 
 class FakeGenerator:
-    def __init__(self, forward: list[str], inverse: list[str]) -> None:
-        self.outputs = [forward, inverse]
+    def __init__(self, *outputs: list[str]) -> None:
+        self.outputs = list(outputs)
+        self.prompts: list[str] = []
 
     def generate(self, prompts, config):
+        self.prompts.append(prompts[0])
         return [self.outputs.pop(0)]
 
 
@@ -25,6 +28,21 @@ class LookupEncoder:
 
 def test_semantic_entropy_for_two_equal_clusters() -> None:
     assert semantic_entropy([2, 2]) == pytest.approx(np.log(2))
+
+
+def test_structured_answer_parser_preserves_supplied_answer() -> None:
+    parsed = parse_structured_answer(
+        "ANSWER || TYPE || QUALIFIER\nRome || LOCATION || capital city of Italy",
+        expected_answer="Rome",
+    )
+    assert parsed["valid"] is True
+    assert parsed["type"] == "LOCATION"
+
+    changed = parse_structured_answer(
+        "Paris || LOCATION || capital city of France", expected_answer="Rome"
+    )
+    assert changed["valid"] is False
+    assert changed["failure_reason"] == "answer_value_changed"
 
 
 def test_cycle_features_capture_dominant_alternative() -> None:
@@ -90,4 +108,60 @@ def test_missing_original_question_gets_unobserved_smoothed_category() -> None:
 
     assert features.original_question_support == pytest.approx(0.5 / 5.0)
     assert features.competing_margin == pytest.approx(np.log(4.5 / 0.5))
+
+
+def test_structured_format_is_used_for_inverse_generation() -> None:
+    question = "What is the capital of France?"
+    forward = [
+        "Paris || LOCATION || capital city of France",
+        "Rome || LOCATION || capital city of Italy",
+    ]
+    canonical = ["Rome || LOCATION || capital city of Italy"]
+    inverse = ["What is the capital of Italy?", "Which city is Italy's capital?"]
+    mapping = {
+        forward[0]: [0.0, 1.0],
+        forward[1]: [1.0, 0.0],
+        inverse[0]: [1.0, 0.0],
+        inverse[1]: [1.0, 0.0],
+        question: [0.0, 1.0],
+    }
+    config = DetectorConfig(
+        forward=GenerationConfig(samples=2),
+        inverse=GenerationConfig(samples=2),
+        answer_format="structured",
+    )
+    extractor = CycleFeatureExtractor(
+        FakeGenerator(forward, canonical, inverse), LookupEncoder(mapping), config
+    )
+
+    _, details = extractor.extract(question, "Rome")
+
+    assert details["canonicalization"]["valid"] is True
+    assert details["inverse_answer"] == "Rome || LOCATION || capital city of Italy"
+    assert details["forward_format_valid"] == [True, True]
+
+
+def test_invalid_canonicalization_falls_back_to_original_answer() -> None:
+    question = "What is the capital of France?"
+    forward = ["Paris || LOCATION || capital city of France"]
+    changed_canonical = ["Paris || LOCATION || capital city of France"]
+    inverse = ["What is the capital of Italy?"]
+    mapping = {
+        forward[0]: [0.0, 1.0],
+        inverse[0]: [1.0, 0.0],
+        question: [0.0, 1.0],
+    }
+    generator = FakeGenerator(forward, changed_canonical, inverse)
+    config = DetectorConfig(
+        forward=GenerationConfig(samples=1),
+        inverse=GenerationConfig(samples=1),
+        answer_format="structured",
+    )
+    extractor = CycleFeatureExtractor(generator, LookupEncoder(mapping), config)
+
+    _, details = extractor.extract(question, "Rome")
+
+    assert details["canonicalization"]["failure_reason"] == "answer_value_changed"
+    assert details["inverse_answer"] == "Rome"
+    assert "Answer: Rome\nQuestion:" in generator.prompts[-1]
 
