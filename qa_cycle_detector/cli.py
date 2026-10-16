@@ -226,7 +226,7 @@ def _generation_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--canonicalization-temperature", type=float, default=0.2)
     parser.add_argument("--canonicalization-tokens", type=int, default=64)
     parser.add_argument(
-        "--answer-format", choices=("short", "structured"), default="short"
+        "--answer-format", choices=("short", "sentence", "structured"), default="sentence"
     )
     parser.add_argument("--answer-tokens", type=int, default=48)
     parser.add_argument("--question-tokens", type=int, default=64)

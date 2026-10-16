@@ -104,9 +104,37 @@ Useful experiment controls include `--forward-samples`, `--inverse-samples`,
 `--forward-temperature`, `--inverse-temperature`, and `--threshold`. Run
 `qa-cycle <command> --help` for all options.
 
+## One-sentence answer experiment
+
+The default answer format is now `sentence`, using this instruction through the
+model's existing chat template:
+
+```text
+Answer the question concisely in one sentence.
+```
+
+No type fields, qualifiers, or canonicalization are requested in this condition.
+Use `--answer-format short` for the original short-answer baseline or
+`--answer-format structured` for the previous schema experiment.
+
+Run the sentence condition in a fresh directory:
+
+```bash
+export CYCLE_RUN_ROOT="${SCRATCH:-$HOME}/qa-cycle-results/sentence-pilot-200"
+export MAX_EXAMPLES=200
+export SHARD_SIZE=10
+export ANSWER_FORMAT=sentence
+bash slurm/submit_pipeline.sh
+```
+
+This changes the sampled forward answers only. Inverse generation still receives
+the supplied, labeled answer unchanged. Existing short-answer predictions are not
+expanded or regraded: evaluating reverse consistency of sentence answers requires
+new sentence predictions and correctness labels for those exact predictions.
+
 ## Structured-answer prompt experiment
 
-The default `short` condition is unchanged. An optional `structured` condition
+The original `short` condition remains available. An optional `structured` condition
 tests whether a minimally disambiguated answer changes inverse consistency:
 
 ```text

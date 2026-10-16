@@ -31,14 +31,14 @@ class DetectorConfig:
     canonicalization: GenerationConfig = GenerationConfig(
         samples=1, temperature=0.2, max_new_tokens=64
     )
-    answer_format: str = "short"
+    answer_format: str = "sentence"
     equivalence_threshold: float = 0.82
     smoothing: float = 0.5
     epsilon: float = 1e-12
 
     def __post_init__(self) -> None:
-        if self.answer_format not in {"short", "structured"}:
-            raise ValueError("answer_format must be 'short' or 'structured'")
+        if self.answer_format not in {"short", "sentence", "structured"}:
+            raise ValueError("answer_format must be 'short', 'sentence', or 'structured'")
         if not -1 <= self.equivalence_threshold <= 1:
             raise ValueError("equivalence_threshold must be in [-1, 1]")
         if self.smoothing < 0:

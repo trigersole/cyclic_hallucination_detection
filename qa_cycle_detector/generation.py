@@ -158,7 +158,9 @@ def parse_structured_answer(
     return result
 
 
-def answer_prompt(question: str, answer_format: str = "short") -> str:
+def answer_prompt(question: str, answer_format: str = "sentence") -> str:
+    if answer_format == "sentence":
+        return f"Answer the question concisely in one sentence.\n\nQuestion: {question}"
     if answer_format == "structured":
         return (
             "Answer the factual question using exactly one line in this format:\n"
@@ -170,7 +172,7 @@ def answer_prompt(question: str, answer_format: str = "short") -> str:
             f"Question: {question}\nAnswer:"
         )
     if answer_format != "short":
-        raise ValueError("answer_format must be 'short' or 'structured'")
+        raise ValueError("answer_format must be 'short', 'sentence', or 'structured'")
     return (
         "Answer the factual question directly and concisely. Return only the answer, "
         f"without commentary.\n\nQuestion: {question}\nAnswer:"

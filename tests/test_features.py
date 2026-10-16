@@ -165,3 +165,29 @@ def test_invalid_canonicalization_falls_back_to_original_answer() -> None:
     assert details["inverse_answer"] == "Rome"
     assert "Answer: Rome\nQuestion:" in generator.prompts[-1]
 
+
+def test_sentence_condition_uses_chat_instruction_without_rewriting_labeled_answer() -> None:
+    question = "What is the capital of France?"
+    forward = ["The capital of France is Paris."]
+    inverse = ["What is the capital of Italy?"]
+    generator = FakeGenerator(forward, inverse)
+    mapping = {
+        forward[0]: [0.0, 1.0],
+        inverse[0]: [1.0, 0.0],
+        question: [0.0, 1.0],
+    }
+    extractor = CycleFeatureExtractor(generator, LookupEncoder(mapping))
+
+    _, details = extractor.extract(question, "Rome")
+
+    assert generator.prompts[0] == (
+        f"Answer the question concisely in one sentence.\n\nQuestion: {question}"
+    )
+    assert len(generator.prompts) == 2
+    assert "Answer: Rome\nQuestion:" in generator.prompts[1]
+    assert question not in generator.prompts[1]
+    assert details["answer_format"] == "sentence"
+    assert details["inverse_answer"] == "Rome"
+    assert details["canonicalization"] is None
+    assert details["forward_format_valid"] is None
+
