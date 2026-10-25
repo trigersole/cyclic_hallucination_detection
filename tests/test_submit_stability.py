@@ -1,0 +1,73 @@
+from __future__ import annotations
+
+from pathlib import Path
+from types import SimpleNamespace
+import sys
+
+import pytest
+
+from scripts import submit_stability
+
+
+def test_plan_reuses_environment_and_only_requires_input(tmp_path):
+    source = tmp_path / "input.jsonl"
+    source.write_text('{}\n', encoding="utf-8")
+    args = submit_stability.parser().parse_args([str(source)])
+    env = {"HALOSCOPE_PYTHON": sys.executable, "HF_HOME": "/existing/shared/cache",
+           "SCRATCH": str(tmp_path), "SLURM_ACCOUNT": "existing-account", "MODEL_ID": "existing-model"}
+    plan = submit_stability.make_plan(args, env)
+    assert plan["python"] == sys.executable
+    assert plan["environment"]["HF_HOME"] == "/existing/shared/cache"
+    assert plan["environment"]["STABILITY_MODEL"] == "existing-model"
+    assert plan["environment"]["STABILITY_MAX_EXAMPLES"] == "2"
+    assert plan["environment"]["STABILITY_LOCAL_FILES_ONLY"] == "1"
+    assert "--account=existing-account" in plan["command"]
+    assert plan["root"].parent == tmp_path / "qa-stability-results"
+    assert not plan["root"].exists()
+    assert "STABILITY_INPUT" not in env  # Caller environment not mutated.
+
+
+def test_dry_run_performs_only_input_validation_and_creates_no_directories(tmp_path, monkeypatch):
+    source = tmp_path / "input.jsonl"
+    source.write_text('{}\n', encoding="utf-8")
+    root = tmp_path / "new"
+    args = submit_stability.parser().parse_args([str(source), "--run-root", str(root), "--dry-run"])
+    calls = []
+    monkeypatch.setattr(submit_stability.subprocess, "run", lambda cmd, **kw: calls.append(cmd))
+    submit_stability.submit(args)
+    assert len(calls) == 1 and calls[0][-1] == "--dry-run"
+    assert not root.exists()
+
+
+def test_submission_passes_isolated_defaults_and_prints_job(tmp_path, monkeypatch, capsys):
+    source = tmp_path / "input.jsonl"
+    source.write_text('{}\n', encoding="utf-8")
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    monkeypatch.setattr(submit_stability, "REPOSITORY", repo)
+    monkeypatch.setenv("SCRATCH", str(tmp_path))
+    monkeypatch.setenv("STABILITY_PYTHON", sys.executable)
+    monkeypatch.setattr(submit_stability.shutil, "which", lambda cmd: "/bin/sbatch")
+    calls = []
+    def run(cmd, **kwargs):
+        calls.append((cmd, kwargs))
+        return SimpleNamespace(stdout="12345;cluster\n")
+    monkeypatch.setattr(submit_stability.subprocess, "run", run)
+    args = submit_stability.parser().parse_args([str(source), "--examples", "20", "--account", "research"])
+    submit_stability.submit(args)
+    assert len(calls) == 4  # input budget, imports, local snapshots, submission
+    command, kwargs = calls[-1]
+    assert command[0] == "sbatch" and "--account=research" in command
+    assert kwargs["env"]["STABILITY_MAX_EXAMPLES"] == "20"
+    assert kwargs["env"]["STABILITY_LOCAL_FILES_ONLY"] == "1"
+    assert Path(kwargs["env"]["STABILITY_RUN_ROOT"]).is_dir()
+    assert kwargs["cwd"] == repo
+    assert "squeue -j 12345" in capsys.readouterr().out
+
+
+def test_rejects_legacy_root_before_submission(tmp_path):
+    source = tmp_path / "input.jsonl"
+    source.write_text('{}\n', encoding="utf-8")
+    args = submit_stability.parser().parse_args([str(source), "--run-root", str(tmp_path)])
+    with pytest.raises(ValueError, match="non-pilot"):
+        submit_stability.make_plan(args, {})
