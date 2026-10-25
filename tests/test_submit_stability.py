@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import json
 from types import SimpleNamespace
 import sys
 
@@ -89,4 +90,22 @@ def test_rejects_legacy_root_before_submission(tmp_path):
     source.write_text('{}\n', encoding="utf-8")
     args = submit_stability.parser().parse_args([str(source), "--run-root", str(tmp_path)])
     with pytest.raises(ValueError, match="non-pilot"):
+        submit_stability.make_plan(args, {})
+
+
+def test_rescore_submission_reads_saved_run_and_uses_new_output(tmp_path):
+    source = tmp_path / "source"
+    (source / "examples" / "00000").mkdir(parents=True)
+    (source / "STABILITY_RUN.json").write_text(json.dumps({"settings": {"model": "source-model"}}), encoding="utf-8")
+    (source / "examples" / "00000" / "raw.json").write_text('{}', encoding="utf-8")
+    args = submit_stability.parser().parse_args(["--rescore-from", str(source)])
+    plan = submit_stability.make_plan(args, {"SCRATCH": str(tmp_path)})
+    assert plan["examples"] == 1
+    assert plan["environment"]["STABILITY_MODEL"] == "source-model"
+    assert plan["environment"]["STABILITY_RESCORE_FROM"] == str(source.resolve())
+    assert plan["environment"]["STABILITY_DIAGNOSTICS"] == "0"
+    assert "--rescore-from" in plan["validation"]
+    assert plan["root"].name.startswith("rescore-")
+    args.run_root = source
+    with pytest.raises(ValueError, match="separate"):
         submit_stability.make_plan(args, {})

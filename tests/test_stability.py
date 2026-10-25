@@ -13,6 +13,8 @@ from qa_cycle_detector.stability import (HFStabilityBackend, INSTRUCTIONS, MODES
                                          semantic_summary, wording_basis)
 from qa_cycle_detector.stability_cli import (collect_example, prepare_run, read_json,
                                              run_pilot, score_example, selected_inputs, unlabeled_rows)
+from qa_cycle_detector.answer_content import (answer_token_indices, parse_extraction,
+                                             span_summary, extraction_prompt)
 
 
 class FakeBackend:
@@ -31,6 +33,18 @@ class FakeBackend:
         if i:
             value[i - 1] = .1
         return value
+
+    def extract_answer(self, question, response, seed):
+        return {"text": json.dumps({"span": response}), "input_tokens": 10, "output_tokens": 5}
+
+    def score_answer_tokens(self, prompt, anchor, extraction, delta=None, reference_logprobs=None):
+        norm = float(np.linalg.norm(delta)) if delta is not None else 0.
+        first, logp = first_token_diagnostics([3. - norm, norm],
+                                             reference_logprobs[0] if reference_logprobs is not None else None)
+        return {"valid": True, "token_indices": [1], "tokens": [],
+                "mean_js_divergence": first.get("js_divergence"),
+                "mean_target_logprob_change": -.01 * norm if reference_logprobs is not None else None,
+                "first_answer_token_js": first.get("js_divergence"), "_answer_logprobs": np.asarray([logp])}
 
     def generate(self, prompt, max_new_tokens, seed, delta=None, temperature=None,
                  diagnostics=False, reference_logprobs=None):
@@ -349,3 +363,154 @@ def test_diagnostic_resume_reuses_anchor_distribution_and_zero_control(tmp_path)
     assert saved == (tmp_path / "generations" / "anchor.first_logprobs.npy").read_bytes()
     assert len(resumed.calls) == config.baseline_samples + len(MODES) * len(config.amplitudes) * config.directions
     assert score_example(raw, FakeEncoder(), config)["zero_control_passed"]
+
+
+def test_extractive_comparison_ignores_observed_preambles_without_merging_entities():
+    responses = ["Wasps.", "Vespiary is the home of wasps.", "Bees."]
+    spans = [parse_extraction(json.dumps({"span": span}), response)
+             for span, response in zip(["Wasps", "wasps", "Bees"], responses)]
+    result = span_summary(spans[:2], spans[0], spans[0])
+    assert result["anchor_flip_rate"] == 0
+    assert result["answer_span_entropy"] == 0
+    assert span_summary(spans, spans[0], spans[0])["anchor_flip_rate"] == pytest.approx(1 / 3)
+    canberra = [parse_extraction('{"span":"Canberra"}', text)
+                for text in ["Canberra", "Sure! The capital of Australia is Canberra."]]
+    assert span_summary(canberra, canberra[0], canberra[0])["anchor_flip_rate"] == 0
+    assert "Do not" in extraction_prompt("q", "wrong response")
+
+
+def test_extraction_rejects_correction_and_lost_negation():
+    assert not parse_extraction('{"span":"tungsten"}', "The answer is gold.")["valid"]
+    gold = parse_extraction('{"span":"gold"}', "The answer is gold.")
+    assert gold["valid"] and gold["canonical"] == "gold"
+    assert not parse_extraction('{"span":"Canberra"}', "It is not Canberra.")["valid"]
+    negative = parse_extraction('{"span":"not Canberra"}', "It is not Canberra.")
+    assert negative["valid"] and negative["canonical"] == "not canberra"
+    for raw in ('{"span":null}', 'not json', '{"span": ""}'):
+        assert not parse_extraction(raw, "An answer")["valid"]
+
+
+def test_answer_token_alignment_skips_empty_and_whitespace_tokens():
+    pieces = {0: "", 1: "Re", 2: "nin", 3: ".", 4: ""}
+    decode = lambda ids: "".join(pieces[i] for i in ids)
+    span = parse_extraction('{"span":"Renin"}', "Renin.")
+    assert answer_token_indices([0, 1, 2, 3, 4], decode, "Renin.", span) == [1, 2]
+    pieces = {0: " ", 1: "Canberra", 2: "."}
+    span = parse_extraction('{"span":"Canberra"}', "Canberra.")
+    assert answer_token_indices([0, 1, 2], decode, "Canberra.", span) == [1]
+    with pytest.raises(ValueError, match="reproduce"):
+        answer_token_indices([0, 1, 2], decode, "A different answer", span)
+
+
+def test_answer_token_alignment_handles_incomplete_unicode_pieces():
+    decoded = {0: "", 1: "", 2: "�", 3: "é", 4: "éclair"}
+    span = parse_extraction('{"span":"éclair"}', "éclair")
+    assert answer_token_indices([10, 11, 12, 13], lambda ids: decoded[len(ids)], "éclair", span) == [1, 2, 3]
+
+
+def test_teacher_forcing_keeps_prefixes_identical_and_intervenes_at_prompt_boundary():
+    class Block:
+        hook = None
+        def register_forward_hook(self, hook):
+            self.hook = hook
+            return SimpleNamespace(remove=lambda: setattr(self, "hook", None))
+    block = Block()
+    seen = []
+    def model(**kwargs):
+        ids = kwargs["input_ids"]
+        hidden = Tensor(np.zeros((1, ids.shape[1], 4)))
+        hidden = block.hook(block, (), hidden)
+        seen.append((ids.copy(), hidden.copy()))
+        logits = np.zeros((1, ids.shape[1], 11))
+        logits[0, 3, 1] = 3 - hidden[0, 2].sum()
+        logits[0, 4, 2] = 3 - hidden[0, 2].sum()
+        return SimpleNamespace(logits=Tensor(logits))
+    model.config = SimpleNamespace(max_position_embeddings=100)
+    pieces = {0: "", 1: "Re", 2: "nin", 3: ".", 4: ""}
+    backend = HFStabilityBackend.__new__(HFStabilityBackend)
+    backend.model, backend.block = model, block
+    backend.torch = SimpleNamespace(inference_mode=nullcontext,
+                                    cat=lambda xs, dim: Tensor(np.concatenate(xs, axis=dim)))
+    backend.tokenizer = SimpleNamespace(decode=lambda ids, **kw: "".join(pieces[i] for i in ids))
+    backend.encode = lambda prompt: {"input_ids": Tensor([[8, 9, 10]]), "attention_mask": Tensor([[1, 1, 1]])}
+    anchor = {"text": "Renin.", "token_ids": [0, 1, 2, 3, 4]}
+    span = parse_extraction('{"span":"Renin"}', anchor["text"])
+    baseline = backend.score_answer_tokens("question", anchor, span)
+    moved = backend.score_answer_tokens("question", anchor, span, delta=np.ones(4),
+                                         reference_logprobs=baseline["_answer_logprobs"])
+    np.testing.assert_array_equal(seen[0][0], seen[1][0])
+    np.testing.assert_array_equal(seen[1][1][0, 2], 1)
+    np.testing.assert_array_equal(seen[1][1][0, -1], 0)
+    assert moved["token_indices"] == [1, 2]  # Not empty formatting token 0.
+    assert moved["tokens"][0]["prefix_text"] == ""
+    assert moved["tokens"][1]["prefix_text"] == "Re"
+    assert moved["mean_js_divergence"] > 0
+    assert moved["mean_target_logprob_change"] < 0
+    assert block.hook is None
+
+
+def test_saved_text_rescore_reuses_generations_and_preserves_source(tmp_path):
+    from qa_cycle_detector.stability_cli import rescore_saved, write_json
+    source_root = tmp_path / "source"
+    config = small_config()
+    write_json(source_root / "STABILITY_RUN.json", {"schema": "wording-stability-pilot-v2",
+               "config": config.to_dict(), "settings": {"model": "fake"}})
+    raw = collect_example(source_root / "examples" / "00000", {"question": source()["question"]}, FakeBackend(), config)
+    for unit in raw["units"]:
+        unit["text"] = "Vespiary is the home of wasps."
+    write_json(source_root / "examples" / "00000" / "raw.json", raw)
+    before = {str(p.relative_to(source_root)): p.read_bytes() for p in source_root.rglob("*") if p.is_file()}
+    class SpanBackend(FakeBackend):
+        def generate(self, *args, **kwargs):
+            raise AssertionError("rescore must never regenerate original answers")
+        def extract_answer(self, question, response, seed):
+            return {"text": json.dumps({"span": "wasps" if "wasps" in response else "Wasps"}),
+                    "input_tokens": 10, "output_tokens": 5}
+    target = tmp_path / "rescore"
+    report = rescore_saved(target, source_root, None, {"model": "fake"}, SpanBackend)
+    assert report["cost"]["generation_calls"] == 0
+    assert report["cost"]["answer_extraction_calls"] == 2
+    assert report["summary"]["wording"]["mean_flip_auc"] == 0
+    assert {str(p.relative_to(source_root)): p.read_bytes() for p in source_root.rglob("*") if p.is_file()} == before
+    def fail():
+        raise AssertionError("complete rescore should not load a model")
+    assert rescore_saved(target, source_root, None, {"model": "fake"}, fail) == report
+
+
+def test_full_content_diagnostics_use_answer_spans_and_token_probes(tmp_path):
+    config = replace(small_config(), diagnostics=True)
+    def no_embedding_model():
+        raise AssertionError("v3 primary scoring must not use whole-response embeddings")
+    report = run_pilot(tmp_path, [{"question": source()["question"]}], config, {"model": "fake"},
+                       FakeBackend, no_embedding_model)
+    score = read_json(tmp_path / "examples" / "00000" / "scores.json")
+    assert score["answer_comparison"] == "question_conditioned_extractive_span_exact"
+    assert score["answer_zero_control_passed"]
+    assert score["scores"]["answer_token_js_auc"]["isotropic"] > 0
+    assert report["summary"]["isotropic"]["mean_answer_token_js_auc"] > 0
+    assert "ranked_by_first_token_wording_corrected" not in report
+
+
+def test_answer_probe_resume_does_not_repeat_extraction_or_anchor_probe(tmp_path):
+    from qa_cycle_detector.stability_cli import collect_content
+    config = replace(small_config(), diagnostics=True)
+    raw = collect_example(tmp_path, {"question": "Example?"}, FakeBackend(), config)
+    class Failing(FakeBackend):
+        probe_calls = 0
+        def score_answer_tokens(self, *args, **kwargs):
+            self.probe_calls += 1
+            if self.probe_calls == 3:
+                raise RuntimeError("probe interrupted")
+            return super().score_answer_tokens(*args, **kwargs)
+    with pytest.raises(RuntimeError, match="probe interrupted"):
+        collect_content(tmp_path, raw, Failing(), config)
+    class Resumed(FakeBackend):
+        probe_calls = 0
+        def extract_answer(self, *args, **kwargs):
+            raise AssertionError("extractions should be cached")
+        def score_answer_tokens(self, *args, **kwargs):
+            self.probe_calls += 1
+            return super().score_answer_tokens(*args, **kwargs)
+    resumed = Resumed()
+    collect_content(tmp_path, read_json(tmp_path / "raw.json"), resumed, config)
+    assert resumed.probe_calls == len(MODES) * len(config.amplitudes) * config.directions

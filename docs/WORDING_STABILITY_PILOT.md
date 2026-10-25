@@ -15,6 +15,84 @@ manually composed questions, no reference answers or correctness labels, and no
 dependency on old runs. It is a small convenience set, not a representative or
 graded benchmark. Existing QA JSONL/shard directories remain optional inputs.
 
+## V3 measurement corrections
+
+The v2 run exposed two failures: its first generated token could be an almost-certain
+formatting token that decodes to an empty string, and sentence cosine could flag
+`Wasps.` versus `Vespiary is the home of wasps.`. V3 corrects these measurements.
+
+**Answer comparison:** For each distinct question/response, the existing generator
+copies the shortest contiguous direct-answer span from the response, using the
+question as context. The prompt forbids answering, fact-checking, or correcting the
+response. Exact-substring validation rejects invented corrections. Extractions
+that drop overt negation are also rejected. Invalid extraction makes that comparison
+unavailable, rather than counting as a different factual answer. Extractions are
+cached without automatic retries and are saved for inspection.
+
+Primary flip rates compare case/Unicode/edge-punctuation-normalized extracted spans,
+not sentence embeddings. This fixes the reported examples when `wasps` or `Canberra`
+is extracted. It avoids merging close but distinct entities by cosine similarity.
+This is answer-candidate identity, not a universal semantic-equivalence test: aliases,
+plural variants, and alternative valid expressions may be overcounted; extraction
+can still select an unhelpful span. Claims outside the direct answer are not checked.
+Inspect `answer_span` and `answer_extractions`. `answer_span_entropy` describes these
+groups; `semantic_entropy` is null for this method.
+
+**Answer-token probabilities:** Diagnostic runs retain the actual generated token
+IDs. The extracted span is aligned using cumulative decoding, preserving whitespace
+and Unicode behavior rather than re-tokenizing the answer into a different sequence.
+Empty/whitespace formatting tokens outside the span are excluded. Failed alignment
+is explicit; the probe never silently falls back to a formatting-token position.
+
+The original anchor prefixes are teacher-forced under every perturbation. At each
+target position all conditions use identical original answer token IDs before that
+position; a perturbed response's new preamble is never used. The intervention remains
+at the last original prompt token, not the end of the teacher-forced sequence.
+Target-token log probabilities, target-versus-competitor margins, full-vocabulary JS,
+and first-answer-token JS are recorded. Later subword positions remain conditional
+on preceding original answer pieces: this is model support, not factual evidence.
+
+The primary diagnostic output is `scores.answer_token_js_auc`,
+`scores.answer_token_wording_corrected`, and
+`ranked_by_answer_token_wording_corrected`. First-token distributions remain as
+formatting diagnostics, without their former ranking. `answer_content_reference.tokens`
+records target tokens and prefix text. Formatting and answer-token zero controls are
+reported separately; investigate failures before interpreting scores.
+
+### Reuse existing responses
+
+On the cluster, with `RUN` pointing to your completed v2 diagnostic directory:
+
+```bash
+python scripts/submit_stability.py --rescore-from "$RUN"
+```
+
+This writes a separate `rescore-*` directory and reruns only answer-span extraction
+and scoring. It does not regenerate perturbation answers, change source files,
+or recover missing probability distributions. The extraction still loads the model,
+so this command submits a GPU job. Original generation costs are recorded separately
+from new extraction costs. A completed rescore is reusable without model loading.
+
+Corrected probability measurements require a fresh run because v2 did not save the
+answer-token distributions/token IDs:
+
+```bash
+python scripts/submit_stability.py --diagnostics
+```
+
+The new schema is `wording-stability-pilot-v3`; older runs are not resumed in place.
+There are still 126 free generations per diagnostic example, plus one cached
+96-token extraction request per unique response and 122 teacher-forced probe requests
+per example. Probes are forward passes, not sampled answers. All stages are
+checkpointed. `answer_probes/anchor.npy` stores one reference matrix; other probes
+store scalar comparisons and selected token details. Missing probes/extractions
+are reported explicitly, not labeled as hallucinations.
+
+The corrected path introduces no correctness labels, retrieval, classifier training,
+or additional model dependency. It uses the existing generator for extractive
+parsing and no longer loads the sentence embedding model. Old embedding options
+are retained for CLI compatibility but do not drive the v3 primary score.
+
 ## Simplest Slurm setup
 
 Once the new pilot files are in your cluster checkout, run from that repository:
@@ -90,14 +168,14 @@ overrides the preset subset. Direct module invocation also supports explicit
 `--amplitudes` and `--max-new-tokens`; those override diagnostic defaults. For a
 custom token limit through Slurm, export `STABILITY_MAX_NEW_TOKENS`.
 
-`scores.json` now includes `anchor_first_token`, `zero_control`, and per-amplitude
+`scores.json` retains the formatting diagnostics `anchor_first_token`, `zero_control`, and per-amplitude
 `conditions[mode][i].first_token`. `scores.first_token_js_auc` integrates first-token
 JS divergence across the tested amplitude range, independently of output truncation.
 It does not estimate AUROC or factual-error probability. It is provided alongside
 the semantic flip summaries, not as a fitted replacement for them. A failed zero
 control produces an explicit warning; do not interpret rankings from that run as
-evidence for the detector. The report includes `mean_first_token_js_auc` for each
-condition and a corresponding diagnostic ranking.
+evidence for the detector. The report labels this as `mean_format_first_token_js_auc`.
+The primary diagnostic ranking now uses answer-token measurements described above.
 
 One float32 full-vocabulary anchor log-probability vector is stored as
 `generations/anchor.first_logprobs.npy` per example, so resumed generations use the
@@ -105,7 +183,7 @@ same reference distribution. Other generations store scalar comparisons and top
 candidates only, avoiding full-vocabulary storage per intervention. Atomic writes
 save the reference before the anchor JSON checkpoint.
 
-This revision uses schema **wording-stability-pilot-v2**. Old results remain
+The current revision uses schema **wording-stability-pilot-v3**. Old results remain
 unchanged and are not resumed under the new implementation; use a fresh root.
 The misleading question-only `supplied_anchor_disagreements` count has been fixed:
 invalid anchors are reported as `empty_or_truncated_anchors`, and supplied-answer
@@ -145,11 +223,9 @@ exist. No corrections are retroactively written to old reports.
    differences arise from the intervention, rather than output-sampling randomness.
    Model weights are never changed. The backend supports Llama/Qwen-style models
    exposing `model.model.layers`; it is not a generic adapter for all architectures.
-6. Embed answers using the existing sentence encoder. Estimate semantic clusters
-   and anchored meaning changes using cosine similarity with a fixed threshold
-   (default 0.82). This is an approximate semantic comparison, not a factuality judge.
-   Clustering uses the project's connected-components rule; chaining can merge
-   imperfectly equivalent responses. Audit actual answers, not only entropy values.
+6. Extract question-conditioned direct-answer spans and compare their normalized
+   identities. Whole-sentence embeddings and their threshold no longer drive the
+   primary flip rate. Audit selected spans, target tokens, and actual responses.
 
 With defaults, each example uses 6 capture forward passes and 65 generations:
 1 greedy anchor + 4 sampled baseline answers + 5 conditions × 3 amplitudes × 4
@@ -218,10 +294,10 @@ been supplied, but no job is submitted by implementing or inspecting this pilot.
 
 Per amplitude and condition, `scores.json` records:
 
-- Approximate semantic entropy across generated answers.
-- Fraction differing in meaning from the unperturbed greedy anchor.
+- Entropy across extracted answer identities.
+- Fraction differing in extracted answer identity from the greedy anchor.
 - Fraction differing from the supplied answer (reported separately).
-- Mean anchor similarity, predictive token entropy, empty-output rate, and
+- Extracted anchor agreement, predictive token entropy, empty-output rate, and
   truncation rate.
 
 `flip_auc[condition]` is the trapezoidal integral of anchor flip fraction over the

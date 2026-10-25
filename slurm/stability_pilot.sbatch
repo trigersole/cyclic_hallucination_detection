@@ -35,6 +35,9 @@ EXTRA_ARGS=()
 if [[ "${STABILITY_DIAGNOSTICS:-0}" == "1" ]]; then
   EXTRA_ARGS+=(--diagnostics)
 fi
+if [[ -n "${STABILITY_RESCORE_FROM:-}" ]]; then
+  EXTRA_ARGS+=(--rescore-from "$STABILITY_RESCORE_FROM")
+fi
 if [[ "${STABILITY_LOCAL_FILES_ONLY:-0}" == "1" ]]; then
   EXTRA_ARGS+=(--local-files-only)
 fi

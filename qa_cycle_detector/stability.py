@@ -11,9 +11,10 @@ from typing import Any
 import numpy as np
 
 from .semantics import cluster_embeddings, similarities_to_target
+from .answer_content import answer_token_indices, extraction_prompt
 
 
-SCHEMA = "wording-stability-pilot-v2"
+SCHEMA = "wording-stability-pilot-v3"
 DIAGNOSTIC_AMPLITUDES = (.005, .02, .05, .1, .2, .4)
 INSTRUCTIONS = (
     "Answer the factual question briefly. Return only the direct answer.",
@@ -159,12 +160,13 @@ class LastPromptIntervention:
     Register only during prefill. No edits to weights or subsequent decoding states.
     """
 
-    def __init__(self, delta=None, capture=False):
+    def __init__(self, delta=None, capture=False, position=-1):
         self.delta = delta
         self.capture = capture
         self.state = None
         self.calls = 0
         self.measurement = None
+        self.position = position
 
     def __call__(self, module, inputs, output):
         self.calls += 1
@@ -174,14 +176,14 @@ class LastPromptIntervention:
         if hidden.ndim != 3 or hidden.shape[0] != 1:
             raise ValueError("pilot requires a single unpadded prompt")
         if self.capture:
-            self.state = hidden[0, -1].detach().float().cpu().numpy().copy()
+            self.state = hidden[0, self.position].detach().float().cpu().numpy().copy()
         if self.delta is None:
             return output
         edited = hidden.clone()
         # Accelerate may place this block on another device; construct noise here.
-        edited[0, -1] = edited[0, -1] + hidden.new_tensor(self.delta)
-        before = hidden[0, -1].detach().float().cpu().numpy().astype(np.float64)
-        after = edited[0, -1].detach().float().cpu().numpy().astype(np.float64)
+        edited[0, self.position] = edited[0, self.position] + hidden.new_tensor(self.delta)
+        before = hidden[0, self.position].detach().float().cpu().numpy().astype(np.float64)
+        after = edited[0, self.position].detach().float().cpu().numpy().astype(np.float64)
         requested = np.asarray(self.delta, dtype=np.float64)
         effective = after - before
         requested_norm = float(np.linalg.norm(requested))
@@ -303,6 +305,7 @@ class HFStabilityBackend:
                                     attention_mask=attention_mask, past_key_values=output.past_key_values,
                                     use_cache=True)
         result = {"text": self.tokenizer.decode(tokens, skip_special_tokens=True).strip(),
+                "token_ids": tokens,
                 "input_tokens": int(inputs["input_ids"].shape[1]), "output_tokens": len(tokens),
                 "mean_token_entropy": float(np.mean(entropies)),
                 "mean_token_logprob": float(np.mean(chosen_logprobs)),
@@ -311,3 +314,55 @@ class HFStabilityBackend:
         if diagnostics:
             result.update(first_token=first, _first_logprobs=first_logprobs)
         return result
+
+    def extract_answer(self, question, response, seed):
+        return self.generate(extraction_prompt(question, response), 96, seed)
+
+    def score_answer_tokens(self, prompt, anchor, extraction, delta=None, reference_logprobs=None):
+        """Teacher-force identical anchor prefixes; perturb only the original prompt boundary."""
+        torch = self.torch
+        ids = anchor.get("token_ids")
+        if not ids:
+            raise ValueError("answer-token diagnostics require original generated token IDs; run a fresh v3 job")
+        decode = lambda sequence: self.tokenizer.decode(sequence, skip_special_tokens=True)
+        indices = answer_token_indices(ids, decode, anchor["text"], extraction)
+        inputs = self.encode(prompt)
+        prompt_length = inputs["input_ids"].shape[1]
+        prefix = inputs["input_ids"].new_tensor([ids[:-1]])
+        inputs["input_ids"] = torch.cat((inputs["input_ids"], prefix), dim=1)
+        inputs["attention_mask"] = torch.cat((inputs["attention_mask"],
+                                              inputs["attention_mask"].new_ones(prefix.shape)), dim=1)
+        limit = getattr(self.model.config, "max_position_embeddings", None)
+        if limit and inputs["input_ids"].shape[1] > limit:
+            raise ValueError("teacher-forced answer exceeds context window")
+        # Full-sequence prefill: the intervention position must remain at the end
+        # of the QUESTION prompt, never at the end of the forced answer prefix.
+        hook = LastPromptIntervention(delta=delta, position=prompt_length - 1)
+        handle = self.block.register_forward_hook(hook)
+        try:
+            with torch.inference_mode():
+                output = self.model(**inputs, use_cache=False)
+        finally:
+            handle.remove()
+        logits = output.logits[0, [prompt_length - 1 + i for i in indices]].detach().float().cpu().numpy()
+        if reference_logprobs is not None and np.asarray(reference_logprobs).shape != logits.shape:
+            raise ValueError("answer-token reference shape mismatch")
+        token_results, distributions = [], []
+        for j, (index, values) in enumerate(zip(indices, logits)):
+            reference = reference_logprobs[j] if reference_logprobs is not None else None
+            diagnostic, logp = first_token_diagnostics(values, reference)
+            target = ids[index]
+            diagnostic.update(index=index, token_id=target, token_text=decode([target]),
+                              prefix_text=decode(ids[:index]), target_logprob=float(logp[target]),
+                              target_logprob_change=float(logp[target] - reference[target]) if reference is not None else None,
+                              target_vs_best_other_margin=float(values[target] - np.max(np.delete(values, target))))
+            token_results.append(diagnostic)
+            distributions.append(logp)
+        return {"valid": True, "token_indices": indices, "tokens": token_results,
+                "prefix_policy": "identical unperturbed answer token IDs before each target position",
+                "mean_target_logprob": float(np.mean([v["target_logprob"] for v in token_results])),
+                "mean_js_divergence": float(np.mean([v["js_divergence"] for v in token_results])) if reference_logprobs is not None else None,
+                "mean_target_logprob_change": float(np.mean([v["target_logprob_change"] for v in token_results])) if reference_logprobs is not None else None,
+                "first_answer_token_js": token_results[0].get("js_divergence"),
+                "intervention_measurement": hook.measurement,
+                "_answer_logprobs": np.asarray(distributions, dtype=np.float32)}

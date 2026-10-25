@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 from datetime import datetime, timezone
 import os
 from pathlib import Path
@@ -22,6 +23,7 @@ def parser():
                         help="optional question-only/QA JSONL; defaults to the new bundled question set")
     result.add_argument("--examples", type=int, default=None, help="default: 2 smoke examples or 4 with --diagnostics")
     result.add_argument("--diagnostics", action="store_true", help="wider perturbation sweep and first-token diagnostics")
+    result.add_argument("--rescore-from", type=Path, help="rescore saved response text in a new output directory; no perturbation generation")
     result.add_argument("--run-root", type=Path, help="optional explicit directory, including for resuming")
     result.add_argument("--model", help="default: STABILITY_MODEL, MODEL_ID, or existing Llama-2 model")
     result.add_argument("--python", dest="python_bin", help="override automatically selected model environment")
@@ -33,7 +35,16 @@ def parser():
 
 
 def make_plan(args, environ):
-    examples = args.examples if args.examples is not None else (4 if args.diagnostics else 2)
+    source_run, source_marker = None, None
+    if args.rescore_from:
+        if args.input or args.diagnostics:
+            raise ValueError("--rescore-from takes its questions from the saved run; omit input and --diagnostics")
+        source_run = args.rescore_from.expanduser().resolve()
+        source_marker = json.loads((source_run / "STABILITY_RUN.json").read_text(encoding="utf-8"))
+        available = len(list(source_run.glob("examples/*/raw.json")))
+        if not available:
+            raise ValueError("saved run has no completed raw responses")
+    examples = args.examples if args.examples is not None else (available if source_run else 4 if args.diagnostics else 2)
     if examples < 1:
         raise ValueError("--examples must be positive")
     filename = "stability_diagnostic_questions.jsonl" if args.diagnostics else "stability_pilot_questions.jsonl"
@@ -47,12 +58,12 @@ def make_plan(args, environ):
                   or (str(candidate) if candidate.is_file() else sys.executable))
     if not (Path(python_bin).is_file() or shutil.which(python_bin)):
         raise ValueError(f"Python not found: {python_bin}; use --python /path/to/existing/venv/bin/python")
-    model = args.model or env.get("STABILITY_MODEL") or env.get("MODEL_ID") or "meta-llama/Llama-2-7b-chat-hf"
+    model = args.model or (source_marker["settings"]["model"] if source_marker else None) or env.get("STABILITY_MODEL") or env.get("MODEL_ID") or "meta-llama/Llama-2-7b-chat-hf"
     automatic = args.run_root is None
     if automatic:
         base = Path(env.get("SCRATCH") or str(Path.home())) / "qa-stability-results"
         stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-        kind = "diagnostics" if args.diagnostics else "pilot"
+        kind = "rescore" if source_run else "diagnostics" if args.diagnostics else "pilot"
         root = base / f"{kind}-{examples}-{stamp}-{uuid.uuid4().hex[:8]}"
     else:
         root = args.run_root.expanduser().resolve()
@@ -61,10 +72,13 @@ def make_plan(args, environ):
     for parent in (root, *root.parents):
         if (parent / "_RUN.json").exists() or (parent / "TRIPLET_RUN.json").exists():
             raise ValueError("choose a pilot directory outside legacy/triplet outputs")
+    if source_run and (root == source_run or source_run in root.parents):
+        raise ValueError("rescore output must be separate from its source")
     overlay = env.get("CYCLE_OVERLAY", str(Path(env.get("SCRATCH") or str(Path.home())) / "qa-cycle-overlay"))
     env.update(STABILITY_INPUT=str(source), STABILITY_RUN_ROOT=str(root), STABILITY_MODEL=model,
                STABILITY_MAX_EXAMPLES=str(examples), STABILITY_PYTHON=python_bin,
                STABILITY_DIAGNOSTICS="1" if args.diagnostics else "0",
+               STABILITY_RESCORE_FROM=str(source_run) if source_run else "",
                STABILITY_LOCAL_FILES_ONLY="0" if args.allow_downloads else "1", CYCLE_OVERLAY=overlay)
     # Preserve HF_HOME/HF_HUB_CACHE and all existing settings; do not invent a new cache.
     env["PYTHONPATH"] = os.pathsep.join(filter(None, [str(REPOSITORY), overlay, env.get("PYTHONPATH")]))
@@ -82,6 +96,8 @@ def make_plan(args, environ):
                   "--run-root", str(root), "--max-examples", str(examples), "--dry-run"]
     if args.diagnostics:
         validation.append("--diagnostics")
+    if source_run:
+        validation += ["--rescore-from", str(source_run)]
     return {"environment": env, "command": command, "validation": validation,
             "python": python_bin, "root": root, "automatic": automatic, "logs": logs,
             "examples": examples, "input": str(source)}
@@ -102,7 +118,7 @@ def submit(args):
         return
     if not shutil.which("sbatch"):
         raise ValueError("sbatch is unavailable; run this command on your cluster login node")
-    subprocess.run([plan["python"], "-c", "import torch, transformers, sentence_transformers; "
+    subprocess.run([plan["python"], "-c", "import torch, transformers; "
                     "print('Model environment OK (GPU checked inside the Slurm job).')"],
                    cwd=REPOSITORY, env=env, check=True)
     # Resolve required cached models on the login node, without loading their weights.
@@ -110,10 +126,9 @@ def submit(args):
         subprocess.run([plan["python"], "-c",
                         "from pathlib import Path; from huggingface_hub import snapshot_download; "
                         "import os; "
-                        "[(snapshot_download(repo_id=m, revision=r, local_files_only=True) "
-                        "if not Path(m).is_dir() else None) for m,r in "
-                        "[(os.environ['STABILITY_MODEL'], os.environ.get('STABILITY_REVISION')), "
-                        "(os.environ.get('STABILITY_EMBEDDING_MODEL', 'sentence-transformers/all-mpnet-base-v2'), None)]]; "
+                        "m=os.environ['STABILITY_MODEL']; "
+                        "snapshot_download(repo_id=m, revision=os.environ.get('STABILITY_REVISION'), local_files_only=True) "
+                        "if not Path(m).is_dir() else None; "
                         "print('Cached model snapshots found.')"],
                        cwd=REPOSITORY, env=env, check=True)
     if plan["automatic"]:
@@ -128,7 +143,9 @@ def submit(args):
     print(f"Log: tail -f {plan['logs'] / f'wording-stability-{job}.out'}")
     print(f"Report: {plan['root'] / 'report.json'}")
     diagnostic_flag = " --diagnostics" if args.diagnostics else ""
-    print(f"Resume after interruption: python scripts/submit_stability.py {shlex.quote(plan['input'])} "
+    input_flag = (f"--rescore-from {shlex.quote(str(args.rescore_from.resolve()))}" if args.rescore_from
+                  else shlex.quote(plan["input"]))
+    print(f"Resume after interruption: python scripts/submit_stability.py {input_flag} "
           f"--examples {plan['examples']} --run-root {shlex.quote(str(plan['root']))}{diagnostic_flag}")
 
 
@@ -136,7 +153,7 @@ def main():
     args = parser().parse_args()
     try:
         submit(args)
-    except (ValueError, subprocess.CalledProcessError) as error:
+    except (OSError, ValueError, subprocess.CalledProcessError) as error:
         if isinstance(error, subprocess.CalledProcessError) and error.stderr:
             print(error.stderr, file=sys.stderr)
         print(f"Setup failed: {error}", file=sys.stderr)
