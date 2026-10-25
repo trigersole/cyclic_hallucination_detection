@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from contextlib import nullcontext
+from dataclasses import replace
 from types import SimpleNamespace
 import json
 
@@ -8,7 +9,7 @@ import numpy as np
 import pytest
 
 from qa_cycle_detector.stability import (HFStabilityBackend, INSTRUCTIONS, MODES, LastPromptIntervention,
-                                         PilotConfig, perturbation, prompts, random_basis,
+                                         PilotConfig, first_token_diagnostics, perturbation, prompts, random_basis,
                                          semantic_summary, wording_basis)
 from qa_cycle_detector.stability_cli import (collect_example, prepare_run, read_json,
                                              run_pilot, score_example, selected_inputs, unlabeled_rows)
@@ -31,14 +32,24 @@ class FakeBackend:
             value[i - 1] = .1
         return value
 
-    def generate(self, prompt, max_new_tokens, seed, delta=None, temperature=None):
+    def generate(self, prompt, max_new_tokens, seed, delta=None, temperature=None,
+                 diagnostics=False, reference_logprobs=None):
         self.calls.append({"prompt": prompt, "seed": seed, "delta": delta, "temperature": temperature})
         if len(self.calls) == self.fail_at:
             raise RuntimeError("interrupted")
         changed = delta is not None and np.linalg.norm(delta[3:]) > .06
-        return {"text": "Bees" if changed else "Wasps", "input_tokens": 12, "output_tokens": 2,
+        result = {"text": "Bees" if changed else "Wasps", "input_tokens": 12, "output_tokens": 2,
                 "mean_token_entropy": .2, "mean_token_logprob": -.1,
                 "truncated": False, "intervention_calls": 1}
+        norm = float(np.linalg.norm(delta)) if delta is not None else 0.
+        result["intervention_measurement"] = ({"state_norm": 10., "requested_norm": norm,
+            "applied_norm": norm, "requested_relative_norm": norm / 10, "applied_relative_norm": norm / 10,
+            "norm_retention": 1. if norm else None, "nonzero_coordinates": 1, "dtype": "fake"}
+            if delta is not None else None)
+        if diagnostics:
+            first, logp = first_token_diagnostics([3. - norm, norm], reference_logprobs)
+            result.update(first_token=first, _first_logprobs=logp)
+        return result
 
 
 class FakeEncoder:
@@ -280,3 +291,61 @@ def test_real_backend_decode_loop_removes_intervention_before_cached_steps():
     assert result["output_tokens"] == 2
     assert model_calls == [(True, True), (False, False)]
     assert block.hook is None
+
+
+def test_first_token_metrics_detect_changes_without_a_greedy_token_flip():
+    anchor, reference = first_token_diagnostics([3., 1., 0.])
+    same, _ = first_token_diagnostics([3., 1., 0.], reference)
+    moved, _ = first_token_diagnostics([2.8, 1.1, 0.], reference)
+    assert same["js_divergence"] == pytest.approx(0, abs=1e-12)
+    assert moved["js_divergence"] > 0
+    assert not moved["top_token_changed"]
+    assert moved["anchor_top_probability_drop"] > 0
+    assert moved["top2_logit_margin"] < anchor["top2_logit_margin"]
+    assert moved["kl_anchor_to_perturbed"] > 0
+    flipped, _ = first_token_diagnostics([0., 4., 0.], reference)
+    assert flipped["top_token_changed"]
+    assert 0 <= flipped["js_divergence"] <= np.log(2)
+
+
+def test_applied_norm_detects_perturbation_lost_to_low_precision():
+    hidden = Tensor(np.full((1, 2, 4), 10000., dtype=np.float16))
+    hook = LastPromptIntervention(delta=np.ones(4))
+    edited = hook(None, None, hidden)
+    np.testing.assert_array_equal(edited, hidden)
+    assert hook.measurement["requested_norm"] == 2
+    assert hook.measurement["applied_norm"] == 0
+    assert hook.measurement["norm_retention"] == 0
+    assert hook.measurement["nonzero_coordinates"] == 0
+
+
+def test_diagnostic_run_records_continuous_changes_with_identical_answers(tmp_path):
+    config = replace(small_config(), diagnostics=True)
+    raw = collect_example(tmp_path, {"question": source()["question"]}, FakeBackend(), config)
+    for unit in raw["units"]:
+        unit["text"] = raw["anchor"]["text"]  # Same text, different first-token distributions.
+    score = score_example(raw, FakeEncoder(), config)
+    assert score["zero_control_passed"]
+    assert score["scores"]["flip_auc"]["isotropic"] == 0
+    assert score["scores"]["first_token_js_auc"]["isotropic"] > 0
+    summary = score["conditions"]["isotropic"][0]["first_token"]
+    assert summary["mean_applied_relative_norm"] == pytest.approx(config.amplitudes[0])
+    assert summary["min_norm_retention"] == 1
+    assert (tmp_path / "generations" / "anchor.first_logprobs.npy").exists()
+    assert "_first_logprobs" not in read_json(tmp_path / "generations" / "anchor.json")
+    zero = next(u for u in raw["units"] if u["mode"] == "zero_control")
+    zero["first_token"]["js_divergence"] = .1
+    assert not score_example(raw, FakeEncoder(), config)["zero_control_passed"]
+
+
+def test_diagnostic_resume_reuses_anchor_distribution_and_zero_control(tmp_path):
+    config = replace(small_config(), diagnostics=True)
+    failing = FakeBackend(fail_at=3)
+    with pytest.raises(RuntimeError, match="interrupted"):
+        collect_example(tmp_path, {"question": "A new question?"}, failing, config)
+    saved = (tmp_path / "generations" / "anchor.first_logprobs.npy").read_bytes()
+    resumed = FakeBackend()
+    raw = collect_example(tmp_path, {"question": "A new question?"}, resumed, config)
+    assert saved == (tmp_path / "generations" / "anchor.first_logprobs.npy").read_bytes()
+    assert len(resumed.calls) == config.baseline_samples + len(MODES) * len(config.amplitudes) * config.directions
+    assert score_example(raw, FakeEncoder(), config)["zero_control_passed"]

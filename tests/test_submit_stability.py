@@ -12,10 +12,20 @@ from scripts import submit_stability
 def test_no_input_argument_selects_fresh_unlabeled_questions():
     from qa_cycle_detector.stability_cli import selected_inputs
     args = submit_stability.parser().parse_args([])
-    rows = selected_inputs(args.input, 20)
+    rows = selected_inputs(submit_stability.make_plan(args, {})["input"], 20)
     assert len(rows) == 20
     assert len({row["id"] for row in rows}) == 20
     assert all(set(row) == {"id", "question"} for row in rows)
+
+
+def test_diagnostic_submission_uses_four_questions_and_preserves_preset_on_resume():
+    args = submit_stability.parser().parse_args(["--diagnostics"])
+    plan = submit_stability.make_plan(args, {})
+    assert plan["examples"] == 4
+    assert plan["environment"]["STABILITY_DIAGNOSTICS"] == "1"
+    assert plan["input"].endswith("stability_diagnostic_questions.jsonl")
+    assert "--diagnostics" in plan["validation"]
+    assert plan["root"].name.startswith("diagnostics-4-")
 
 
 def test_plan_reuses_environment_and_only_requires_input(tmp_path):

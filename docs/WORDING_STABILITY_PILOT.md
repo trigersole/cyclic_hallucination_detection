@@ -52,6 +52,66 @@ The submitter prints a basic resume command; repeat any model/account overrides
 used originally. The cache preflight checks snapshot availability; actual weight
 loading and GPU compatibility are checked when the job runs.
 
+## Diagnostic follow-up after an all-zero run
+
+```bash
+python scripts/submit_stability.py --diagnostics
+```
+
+This creates a new four-question job and a separate `diagnostics-4-*` result root.
+It uses the atomic-number, enzyme, vespiary, and Australia-capital questions from
+the first pilot. They have no stored reference answers or correctness labels.
+The preset runs:
+
+- Relative perturbation amplitudes **0.005, 0.02, 0.05, 0.1, 0.2, 0.4**, fixed in
+  advance and identical across all five conditions. Large amplitudes are stress
+  tests; degraded output is recorded rather than treated as evidence of factual error.
+- A **64-token output limit**, reducing the 24-token truncation seen previously.
+- A **zero-perturbation control**, which should reproduce the greedy anchor and
+  its first-token distribution. Inspect `zero_control_failures` before interpreting
+  differences. Small numerical divergence is allowed up to JS divergence 1e-8.
+- **Actual perturbation measurements** after addition in model precision: requested
+  and effective L2 norms, relative norms, retained-norm ratio, affected coordinate
+  count, and dtype. This detects noise rounded away by low precision.
+- **First-token distribution diagnostics**, before any generated answer prefix:
+  full-vocabulary Jensen-Shannon divergence (nats), KL(anchor || perturbed), change
+  in probability/log probability of the anchor's preferred token, top-two logit
+  and probability margins, top-token switches, and decoded top-five candidates.
+
+First-token information can reveal distribution changes even when greedy text
+does not change. The first token can be formatting or a preamble, rather than the
+factual answer token; these diagnostics are not a semantic uncertainty estimator
+or a validated hallucination score. Mean answer-token entropy is retained separately.
+
+The preset uses 126 generations per question (including the zero control), four
+questions, and at most 32,256 generated tokens. Actual cost depends on EOS stopping.
+Use `--diagnostics --dry-run` to preview. Supplying `--examples` or a custom input
+overrides the preset subset. Direct module invocation also supports explicit
+`--amplitudes` and `--max-new-tokens`; those override diagnostic defaults. For a
+custom token limit through Slurm, export `STABILITY_MAX_NEW_TOKENS`.
+
+`scores.json` now includes `anchor_first_token`, `zero_control`, and per-amplitude
+`conditions[mode][i].first_token`. `scores.first_token_js_auc` integrates first-token
+JS divergence across the tested amplitude range, independently of output truncation.
+It does not estimate AUROC or factual-error probability. It is provided alongside
+the semantic flip summaries, not as a fitted replacement for them. A failed zero
+control produces an explicit warning; do not interpret rankings from that run as
+evidence for the detector. The report includes `mean_first_token_js_auc` for each
+condition and a corresponding diagnostic ranking.
+
+One float32 full-vocabulary anchor log-probability vector is stored as
+`generations/anchor.first_logprobs.npy` per example, so resumed generations use the
+same reference distribution. Other generations store scalar comparisons and top
+candidates only, avoiding full-vocabulary storage per intervention. Atomic writes
+save the reference before the anchor JSON checkpoint.
+
+This revision uses schema **wording-stability-pilot-v2**. Old results remain
+unchanged and are not resumed under the new implementation; use a fresh root.
+The misleading question-only `supplied_anchor_disagreements` count has been fixed:
+invalid anchors are reported as `empty_or_truncated_anchors`, and supplied-answer
+disagreements are counted only when an actual supplied answer and usable anchor
+exist. No corrections are retroactively written to old reports.
+
 ## What is implemented
 
 1. Keep the question verbatim. Use six fixed answer-instruction variants to estimate

@@ -18,9 +18,10 @@ REPOSITORY = Path(__file__).resolve().parents[1]
 
 def parser():
     result = argparse.ArgumentParser(description=__doc__)
-    result.add_argument("input", nargs="?", default=str(REPOSITORY / "data" / "stability_pilot_questions.jsonl"),
+    result.add_argument("input", nargs="?", default=None,
                         help="optional question-only/QA JSONL; defaults to the new bundled question set")
-    result.add_argument("--examples", type=int, default=2, help="default: 2-example smoke test; use 20 for pilot")
+    result.add_argument("--examples", type=int, default=None, help="default: 2 smoke examples or 4 with --diagnostics")
+    result.add_argument("--diagnostics", action="store_true", help="wider perturbation sweep and first-token diagnostics")
     result.add_argument("--run-root", type=Path, help="optional explicit directory, including for resuming")
     result.add_argument("--model", help="default: STABILITY_MODEL, MODEL_ID, or existing Llama-2 model")
     result.add_argument("--python", dest="python_bin", help="override automatically selected model environment")
@@ -32,9 +33,11 @@ def parser():
 
 
 def make_plan(args, environ):
-    if args.examples < 1:
+    examples = args.examples if args.examples is not None else (4 if args.diagnostics else 2)
+    if examples < 1:
         raise ValueError("--examples must be positive")
-    source = Path(args.input).expanduser().resolve()
+    filename = "stability_diagnostic_questions.jsonl" if args.diagnostics else "stability_pilot_questions.jsonl"
+    source = Path(args.input or REPOSITORY / "data" / filename).expanduser().resolve()
     if not source.exists():
         raise ValueError(f"input does not exist: {source}")
     env = dict(environ)
@@ -49,7 +52,8 @@ def make_plan(args, environ):
     if automatic:
         base = Path(env.get("SCRATCH") or str(Path.home())) / "qa-stability-results"
         stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-        root = base / f"pilot-{args.examples}-{stamp}-{uuid.uuid4().hex[:8]}"
+        kind = "diagnostics" if args.diagnostics else "pilot"
+        root = base / f"{kind}-{examples}-{stamp}-{uuid.uuid4().hex[:8]}"
     else:
         root = args.run_root.expanduser().resolve()
         if root.exists() and any(root.iterdir()) and not (root / "STABILITY_RUN.json").is_file():
@@ -59,7 +63,8 @@ def make_plan(args, environ):
             raise ValueError("choose a pilot directory outside legacy/triplet outputs")
     overlay = env.get("CYCLE_OVERLAY", str(Path(env.get("SCRATCH") or str(Path.home())) / "qa-cycle-overlay"))
     env.update(STABILITY_INPUT=str(source), STABILITY_RUN_ROOT=str(root), STABILITY_MODEL=model,
-               STABILITY_MAX_EXAMPLES=str(args.examples), STABILITY_PYTHON=python_bin,
+               STABILITY_MAX_EXAMPLES=str(examples), STABILITY_PYTHON=python_bin,
+               STABILITY_DIAGNOSTICS="1" if args.diagnostics else "0",
                STABILITY_LOCAL_FILES_ONLY="0" if args.allow_downloads else "1", CYCLE_OVERLAY=overlay)
     # Preserve HF_HOME/HF_HUB_CACHE and all existing settings; do not invent a new cache.
     env["PYTHONPATH"] = os.pathsep.join(filter(None, [str(REPOSITORY), overlay, env.get("PYTHONPATH")]))
@@ -74,9 +79,12 @@ def make_plan(args, environ):
         command.append(f"--partition={args.partition}")
     command.append(str(REPOSITORY / "slurm" / "stability_pilot.sbatch"))
     validation = [python_bin, "-m", "qa_cycle_detector.stability_cli", "--input", str(source),
-                  "--run-root", str(root), "--max-examples", str(args.examples), "--dry-run"]
+                  "--run-root", str(root), "--max-examples", str(examples), "--dry-run"]
+    if args.diagnostics:
+        validation.append("--diagnostics")
     return {"environment": env, "command": command, "validation": validation,
-            "python": python_bin, "root": root, "automatic": automatic, "logs": logs}
+            "python": python_bin, "root": root, "automatic": automatic, "logs": logs,
+            "examples": examples, "input": str(source)}
 
 
 def submit(args):
@@ -114,13 +122,14 @@ def submit(args):
     result = subprocess.run(plan["command"], cwd=REPOSITORY, env=env, check=True,
                             text=True, capture_output=True)
     job = result.stdout.strip().split(";")[0]
-    print(f"Submitted {args.examples}-example stability pilot: {job}")
+    print(f"Submitted {plan['examples']}-example stability pilot: {job}")
     print(f"Results: {plan['root']}")
     print(f"Monitor: squeue -j {job}")
     print(f"Log: tail -f {plan['logs'] / f'wording-stability-{job}.out'}")
     print(f"Report: {plan['root'] / 'report.json'}")
-    print(f"Resume after interruption: python scripts/submit_stability.py {shlex.quote(args.input)} "
-          f"--examples {args.examples} --run-root {shlex.quote(str(plan['root']))}")
+    diagnostic_flag = " --diagnostics" if args.diagnostics else ""
+    print(f"Resume after interruption: python scripts/submit_stability.py {shlex.quote(plan['input'])} "
+          f"--examples {plan['examples']} --run-root {shlex.quote(str(plan['root']))}{diagnostic_flag}")
 
 
 def main():

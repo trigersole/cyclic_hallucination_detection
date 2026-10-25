@@ -13,7 +13,7 @@ from typing import Any
 import numpy as np
 
 from .semantics import SentenceTransformerEncoder, similarities_to_target
-from .stability import (HFStabilityBackend, INSTRUCTIONS, MODES, SCHEMA, PilotConfig,
+from .stability import (DIAGNOSTIC_AMPLITUDES, HFStabilityBackend, INSTRUCTIONS, MODES, SCHEMA, PilotConfig,
                         perturbation, prompts, random_basis, semantic_summary, wording_basis)
 
 
@@ -111,11 +111,25 @@ def locked(root):
         path.unlink()
 
 
-def cached_generation(path, backend, prompt, config, seed, delta=None, temperature=None):
+def cached_generation(path, backend, prompt, config, seed, delta=None, temperature=None,
+                      reference_logprobs=None, store_reference=False):
     if path.exists():
         return read_json(path)
     start = time.perf_counter()
-    value = backend.generate(prompt, config.max_new_tokens, seed, delta=delta, temperature=temperature)
+    kwargs = {"delta": delta, "temperature": temperature}
+    if config.diagnostics:
+        kwargs.update(diagnostics=True, reference_logprobs=reference_logprobs)
+    value = backend.generate(prompt, config.max_new_tokens, seed, **kwargs)
+    first = value.pop("_first_logprobs", None)
+    if store_reference:
+        if first is None:
+            raise ValueError("diagnostic backend did not return anchor vocabulary probabilities")
+        destination = path.with_suffix(".first_logprobs.npy")
+        temporary = destination.with_suffix(".npy.tmp")
+        temporary.parent.mkdir(parents=True, exist_ok=True)
+        with temporary.open("wb") as handle:
+            np.save(handle, first, allow_pickle=False)
+        os.replace(temporary, destination)
     value.update(seconds=time.perf_counter() - start, seed=seed)
     write_json(path, value)
     return value
@@ -153,12 +167,22 @@ def collect_example(directory, row, backend, config):
         write_json(state_path, state)
     basis = np.asarray(state["wording_basis"])
     control = np.asarray(state["random_basis"])
-    anchor = cached_generation(directory / "generations" / "anchor.json", backend, views[0], config, seed)
+    anchor_path = directory / "generations" / "anchor.json"
+    anchor = cached_generation(anchor_path, backend, views[0], config, seed,
+                               store_reference=config.diagnostics)
+    reference = None
+    if config.diagnostics:
+        reference = np.load(anchor_path.with_suffix(".first_logprobs.npy"), allow_pickle=False)
     units = []
+    if config.diagnostics:
+        value = cached_generation(directory / "generations" / "zero_control.json", backend,
+                                  views[0], config, seed, delta=np.zeros(basis.shape[0]),
+                                  reference_logprobs=reference)
+        units.append({"mode": "zero_control", "direction": 0, "amplitude": 0., **value})
     for direction in range(config.baseline_samples):
         value = cached_generation(directory / "generations" / f"baseline_{direction}.json", backend,
                                   views[0], config, (seed + 1000 + direction) % (2 ** 31),
-                                  temperature=config.baseline_temperature)
+                                  temperature=config.baseline_temperature, reference_logprobs=reference)
         units.append({"mode": "baseline", "direction": direction, "amplitude": None, **value})
     for aindex, amplitude in enumerate(config.amplitudes):
         for direction in range(config.directions):
@@ -166,13 +190,35 @@ def collect_example(directory, row, backend, config):
             for mode in MODES:
                 delta = perturbation(mode, basis, control, direction_seed, amplitude, state["state_norm"])
                 value = cached_generation(directory / "generations" / f"a{aindex}_d{direction}_{mode}.json",
-                                          backend, views[0], config, direction_seed, delta=delta)
+                                          backend, views[0], config, direction_seed, delta=delta,
+                                          reference_logprobs=reference)
                 units.append({"mode": mode, "direction": direction, "amplitude": amplitude,
                               "delta_norm": float(np.linalg.norm(delta)), **value})
         print(f"  completed perturbation amplitude {amplitude:g}", flush=True)
     result = {"schema": SCHEMA, "input": row, "anchor": anchor, "state": state, "units": units}
     write_json(directory / "raw.json", result)
     return result
+
+
+def diagnostic_summary(units, anchor):
+    first = [u["first_token"] for u in units]
+    measurements = [u.get("intervention_measurement") for u in units]
+    valid_measurements = [m for m in measurements if m is not None]
+    retention = [m["norm_retention"] for m in valid_measurements if m["norm_retention"] is not None]
+    return {"mean_js_divergence": float(np.mean([v["js_divergence"] for v in first])),
+            "max_js_divergence": max(v["js_divergence"] for v in first),
+            "mean_anchor_top_probability_drop": float(np.mean([v["anchor_top_probability_drop"] for v in first])),
+            "mean_top2_logit_margin_change": float(np.mean([v["top2_logit_margin"] - anchor["top2_logit_margin"]
+                                                             for v in first])),
+            "top_token_flip_rate": float(np.mean([v["top_token_changed"] for v in first])),
+            "mean_requested_relative_norm": float(np.mean([m["requested_relative_norm"] for m in valid_measurements]))
+                if valid_measurements else None,
+            "mean_applied_relative_norm": float(np.mean([m["applied_relative_norm"] for m in valid_measurements]))
+                if valid_measurements else None,
+            "min_norm_retention": min(retention) if retention else None,
+            "max_norm_retention": max(retention) if retention else None,
+            "zero_effective_perturbations": sum(m["applied_norm"] == 0 and m["requested_norm"] > 0
+                                                 for m in valid_measurements)}
 
 
 def score_example(raw, encoder, config):
@@ -197,6 +243,8 @@ def score_example(raw, encoder, config):
         result["truncated_rate"] = sum(u["truncated"] for u in units) / len(units)
         result["mean_token_entropy"] = float(np.mean([u["mean_token_entropy"] for u in units]))
         result["seconds"] = sum(u["seconds"] for u in units)
+        if config.diagnostics:
+            result["first_token"] = diagnostic_summary(units, raw["anchor"]["first_token"])
         return result
 
     baseline = summarize([u for u in raw["units"] if u["mode"] == "baseline"])
@@ -225,7 +273,8 @@ def score_example(raw, encoder, config):
     generated = [raw["anchor"], *raw["units"]]
     anchor_similarity = float(similarities_to_target(np.asarray([anchor]), supplied)[0])
     anchor_agreement = anchor_valid and anchor_similarity >= config.equivalence_threshold
-    return {"schema": SCHEMA, "input": raw["input"], "anchor": raw["anchor"]["text"],
+    result = {"schema": SCHEMA, "input": raw["input"], "anchor": raw["anchor"]["text"],
+            "anchor_usable": anchor_valid,
             "answer": answer, "answer_source": answer_source,
             "supplied_anchor_similarity": anchor_similarity,
             "supplied_anchor_equivalent": anchor_agreement,
@@ -243,20 +292,48 @@ def score_example(raw, encoder, config):
                      "generation_seconds": sum(u["seconds"] for u in generated),
                      "capture_seconds": raw["state"]["capture_seconds"],
                      "semantic_scoring_seconds": time.perf_counter() - started}}
+    if config.diagnostics:
+        zero = next(u for u in raw["units"] if u["mode"] == "zero_control")
+        passed = (zero["text"] == raw["anchor"]["text"] and zero["first_token"]["js_divergence"] <= 1e-8
+                  and zero["intervention_measurement"]["applied_norm"] == 0)
+        js_auc = {}
+        x = np.asarray([0.] + list(config.amplitudes))
+        for mode, values in conditions.items():
+            y = np.asarray([0.] + [v["first_token"]["mean_js_divergence"] for v in values])
+            js_auc[mode] = float(np.sum(np.diff(x) * (y[1:] + y[:-1]) / 2) / x[-1])
+        result["zero_control_passed"] = passed
+        result["zero_control"] = {"text": zero["text"], "first_token": zero["first_token"],
+                                  "intervention_measurement": zero["intervention_measurement"]}
+        result["anchor_first_token"] = raw["anchor"]["first_token"]
+        result["scores"]["first_token_js_auc"] = js_auc
+        result["scores"]["first_token_wording_corrected"] = js_auc["orthogonal"] - js_auc["wording"]
+        if not passed:
+            result["diagnostic_warning"] = "Zero control failed: inspect numerical nondeterminism or intervention integrity."
+    return result
 
 
 def aggregate(scores):
     ranking = sorted((s for s in scores if s["scores"]["wording_corrected"] is not None),
                      key=lambda s: s["scores"]["wording_corrected"], reverse=True)
     return {"schema": SCHEMA, "examples": len(scores), "label_usage": "none; correctness fields discarded",
-            "supplied_anchor_disagreements": sum(not s["supplied_anchor_equivalent"] for s in scores),
+            "empty_or_truncated_anchors": sum(not s["anchor_usable"] for s in scores),
+            "supplied_anchor_disagreements": sum(s["answer_source"] == "supplied" and s["anchor_usable"]
+                                                  and not s["supplied_anchor_equivalent"] for s in scores),
+            "zero_control_failures": sum(s.get("zero_control_passed") is False for s in scores),
             "usable_examples": {mode: sum(s["usable_conditions"][mode] for s in scores) for mode in MODES},
             "summary": {mode: {"mean_flip_auc": float(np.mean(values)) if values else None,
-                                "examples": len(values)}
+                                "examples": len(values),
+                                "mean_first_token_js_auc": float(np.mean(js_values)) if js_values else None}
                         for mode in MODES
                         for values in [[s["scores"]["flip_auc"][mode] for s in scores
-                                        if s["scores"]["flip_auc"][mode] is not None]]},
+                                        if s["scores"]["flip_auc"][mode] is not None]]
+                        for js_values in [[s["scores"]["first_token_js_auc"][mode] for s in scores
+                                           if "first_token_js_auc" in s["scores"]]]},
             "ranked_by_wording_corrected": [{"input": s["input"], "scores": s["scores"]} for s in ranking],
+            "ranked_by_first_token_wording_corrected": [
+                {"input": s["input"], "scores": s["scores"]} for s in sorted(
+                    [s for s in scores if "first_token_wording_corrected" in s["scores"]],
+                    key=lambda s: s["scores"]["first_token_wording_corrected"], reverse=True)],
             "cost": {key: sum(s["cost"][key] for s in scores) for key in scores[0]["cost"]},
             "interpretation": "Diagnostic pilot only. No correctness labels, threshold fitting, or accuracy claims. "
                               "Compare wording correction against equal-rank random controls before attributing an effect."}
@@ -299,10 +376,11 @@ def run_pilot(root, rows, config, settings, backend_factory, encoder_factory):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--input", default=str(Path(__file__).resolve().parents[1] / "data" / "stability_pilot_questions.jsonl"),
+    parser.add_argument("--input", default=None,
                         help="question-only/QA JSONL or shard directory; defaults to fresh bundled questions")
     parser.add_argument("--run-root", required=True, help="new, separate output directory")
-    parser.add_argument("--max-examples", type=int, default=20)
+    parser.add_argument("--max-examples", type=int, default=None)
+    parser.add_argument("--diagnostics", action="store_true", help="first-token metrics, zero control, wider sweep, four diagnostic questions")
     parser.add_argument("--model", default="Qwen/Qwen2.5-3B-Instruct")
     parser.add_argument("--revision", default=None, help="prefer an immutable model commit")
     parser.add_argument("--embedding-model", default="sentence-transformers/all-mpnet-base-v2")
@@ -313,20 +391,27 @@ def main():
     parser.add_argument("--layer", type=int, default=None, help="zero-based decoder block; default middle block")
     parser.add_argument("--rank", type=int, default=3)
     parser.add_argument("--directions", type=int, default=4)
-    parser.add_argument("--amplitudes", type=float, nargs="+", default=[.005, .02, .05])
+    parser.add_argument("--amplitudes", type=float, nargs="+", default=None)
     parser.add_argument("--baseline-samples", type=int, default=4)
     parser.add_argument("--baseline-temperature", type=float, default=.8)
-    parser.add_argument("--max-new-tokens", type=int, default=24)
+    parser.add_argument("--max-new-tokens", type=int, default=None)
     parser.add_argument("--equivalence-threshold", type=float, default=.82)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--dry-run", action="store_true", help="validate inputs and print budget; no model loading or writes")
     args = parser.parse_args()
-    config = PilotConfig(args.rank, args.directions, tuple(args.amplitudes), args.baseline_samples,
-                         args.baseline_temperature, args.max_new_tokens, args.equivalence_threshold, args.seed)
+    if args.input is None:
+        filename = "stability_diagnostic_questions.jsonl" if args.diagnostics else "stability_pilot_questions.jsonl"
+        args.input = str(Path(__file__).resolve().parents[1] / "data" / filename)
+    if args.max_examples is None:
+        args.max_examples = 4 if args.diagnostics else 20
+    amplitudes = args.amplitudes if args.amplitudes is not None else (DIAGNOSTIC_AMPLITUDES if args.diagnostics else (.005, .02, .05))
+    tokens = args.max_new_tokens if args.max_new_tokens is not None else (64 if args.diagnostics else 24)
+    config = PilotConfig(args.rank, args.directions, tuple(amplitudes), args.baseline_samples,
+                         args.baseline_temperature, tokens, args.equivalence_threshold, args.seed, args.diagnostics)
     rows = selected_inputs(args.input, args.max_examples)
     settings = {key: getattr(args, key) for key in ("model", "revision", "embedding_model", "embedding_device",
                                                   "device_map", "torch_dtype", "local_files_only", "layer")}
-    calls = 1 + config.baseline_samples + len(MODES) * len(config.amplitudes) * config.directions
+    calls = 1 + int(config.diagnostics) + config.baseline_samples + len(MODES) * len(config.amplitudes) * config.directions
     if args.dry_run:
         print(json.dumps({"examples": len(rows), "labels_used": False,
                           "generation_calls_per_example": calls, "capture_passes_per_example": len(INSTRUCTIONS),

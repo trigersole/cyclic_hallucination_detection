@@ -13,7 +13,8 @@ import numpy as np
 from .semantics import cluster_embeddings, similarities_to_target
 
 
-SCHEMA = "wording-stability-pilot-v1"
+SCHEMA = "wording-stability-pilot-v2"
+DIAGNOSTIC_AMPLITUDES = (.005, .02, .05, .1, .2, .4)
 INSTRUCTIONS = (
     "Answer the factual question briefly. Return only the direct answer.",
     "Give a brief direct answer to the factual question, without explanation.",
@@ -35,6 +36,7 @@ class PilotConfig:
     max_new_tokens: int = 24
     equivalence_threshold: float = .82
     seed: int = 42
+    diagnostics: bool = False
 
     def __post_init__(self):
         if min(self.rank, self.directions, self.baseline_samples, self.max_new_tokens) < 1:
@@ -119,6 +121,38 @@ def semantic_summary(texts: list[str], embeddings: np.ndarray, anchor_embedding:
             "mean_anchor_similarity": float(anchor.mean())}
 
 
+def first_token_diagnostics(logits, reference_logprobs=None):
+    """Full-vocabulary distribution comparison before any answer token is supplied."""
+    x = np.asarray(logits, dtype=np.float64)
+    if x.ndim != 1 or len(x) < 2 or not np.isfinite(x).all():
+        raise ValueError("expected finite first-token vocabulary logits")
+    shifted = x - x.max()
+    logp = shifted - np.log(np.exp(shifted).sum())
+    p = np.exp(logp)
+    top = np.argsort(-p, kind="stable")[:5]
+    result = {"entropy": float(-np.dot(p, logp)), "top_token_id": int(top[0]),
+              "top_probability": float(p[top[0]]),
+              "top2_logit_margin": float(x[top[0]] - x[top[1]]),
+              "top2_probability_margin": float(p[top[0]] - p[top[1]]),
+              "top_tokens": [{"id": int(i), "probability": float(p[i])} for i in top]}
+    if reference_logprobs is not None:
+        ref = np.asarray(reference_logprobs, dtype=np.float64)
+        if ref.shape != logp.shape or not np.isfinite(ref).all():
+            raise ValueError("anchor and perturbed vocabulary distributions differ")
+        # Normalize again to handle float32 checkpoint rounding.
+        ref = ref - np.logaddexp.reduce(ref)
+        q = np.exp(ref)
+        mix = np.logaddexp(ref, logp) - np.log(2.)
+        anchor_top = int(np.argmax(q))
+        js = .5 * (np.dot(q, ref - mix) + np.dot(p, logp - mix))
+        result.update(js_divergence=max(0., float(js)),
+                      kl_anchor_to_perturbed=max(0., float(np.dot(q, ref - logp))),
+                      anchor_top_probability_drop=float(q[anchor_top] - p[anchor_top]),
+                      anchor_top_logprob_change=float(logp[anchor_top] - ref[anchor_top]),
+                      top_token_changed=int(top[0]) != anchor_top)
+    return result, logp.astype(np.float32)
+
+
 class LastPromptIntervention:
     """One hook on one decoder block's output at the last prompt-token position.
 
@@ -130,6 +164,7 @@ class LastPromptIntervention:
         self.capture = capture
         self.state = None
         self.calls = 0
+        self.measurement = None
 
     def __call__(self, module, inputs, output):
         self.calls += 1
@@ -145,6 +180,20 @@ class LastPromptIntervention:
         edited = hidden.clone()
         # Accelerate may place this block on another device; construct noise here.
         edited[0, -1] = edited[0, -1] + hidden.new_tensor(self.delta)
+        before = hidden[0, -1].detach().float().cpu().numpy().astype(np.float64)
+        after = edited[0, -1].detach().float().cpu().numpy().astype(np.float64)
+        requested = np.asarray(self.delta, dtype=np.float64)
+        effective = after - before
+        requested_norm = float(np.linalg.norm(requested))
+        applied_norm = float(np.linalg.norm(effective))
+        state_norm = float(np.linalg.norm(before))
+        self.measurement = {"state_norm": state_norm, "requested_norm": requested_norm,
+                            "applied_norm": applied_norm,
+                            "requested_relative_norm": requested_norm / state_norm if state_norm else None,
+                            "applied_relative_norm": applied_norm / state_norm if state_norm else None,
+                            "norm_retention": applied_norm / requested_norm if requested_norm else None,
+                            "nonzero_coordinates": int(np.count_nonzero(effective)),
+                            "dtype": str(hidden.dtype)}
         return (edited, *output[1:]) if isinstance(output, tuple) else edited
 
 
@@ -204,7 +253,8 @@ class HFStabilityBackend:
             raise RuntimeError("decoder hook was not invoked")
         return hook.state
 
-    def generate(self, prompt, max_new_tokens, seed, delta=None, temperature=None):
+    def generate(self, prompt, max_new_tokens, seed, delta=None, temperature=None,
+                 diagnostics=False, reference_logprobs=None):
         torch = self.torch
         torch.manual_seed(seed)
         if torch.cuda.is_available():
@@ -220,6 +270,12 @@ class HFStabilityBackend:
                 output = self.model(**inputs, use_cache=True)
         finally:
             handle.remove()
+        first, first_logprobs = None, None
+        if diagnostics:
+            first, first_logprobs = first_token_diagnostics(
+                output.logits[0, -1].detach().float().cpu().numpy(), reference_logprobs)
+            for entry in first["top_tokens"]:
+                entry["text"] = self.tokenizer.decode([entry["id"]], skip_special_tokens=False)
         eos = self.model.generation_config.eos_token_id
         if eos is None:
             eos = self.tokenizer.eos_token_id
@@ -246,8 +302,12 @@ class HFStabilityBackend:
                 output = self.model(input_ids=token.to(self.device),
                                     attention_mask=attention_mask, past_key_values=output.past_key_values,
                                     use_cache=True)
-        return {"text": self.tokenizer.decode(tokens, skip_special_tokens=True).strip(),
+        result = {"text": self.tokenizer.decode(tokens, skip_special_tokens=True).strip(),
                 "input_tokens": int(inputs["input_ids"].shape[1]), "output_tokens": len(tokens),
                 "mean_token_entropy": float(np.mean(entropies)),
                 "mean_token_logprob": float(np.mean(chosen_logprobs)),
-                "truncated": tokens[-1] not in eos, "intervention_calls": hook.calls}
+                "truncated": tokens[-1] not in eos, "intervention_calls": hook.calls,
+                "intervention_measurement": hook.measurement}
+        if diagnostics:
+            result.update(first_token=first, _first_logprobs=first_logprobs)
+        return result

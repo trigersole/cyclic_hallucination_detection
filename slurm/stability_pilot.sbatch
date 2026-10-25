@@ -32,6 +32,9 @@ fi
 "$STABILITY_PYTHON" -c 'import torch; assert torch.cuda.is_available(), "No usable CUDA GPU allocated"'
 
 EXTRA_ARGS=()
+if [[ "${STABILITY_DIAGNOSTICS:-0}" == "1" ]]; then
+  EXTRA_ARGS+=(--diagnostics)
+fi
 if [[ "${STABILITY_LOCAL_FILES_ONLY:-0}" == "1" ]]; then
   EXTRA_ARGS+=(--local-files-only)
 fi
@@ -40,6 +43,9 @@ if [[ -n "${STABILITY_REVISION:-}" ]]; then
 fi
 if [[ -n "${STABILITY_LAYER:-}" ]]; then
   EXTRA_ARGS+=(--layer "$STABILITY_LAYER")
+fi
+if [[ -n "${STABILITY_MAX_NEW_TOKENS:-}" ]]; then
+  EXTRA_ARGS+=(--max-new-tokens "$STABILITY_MAX_NEW_TOKENS")
 fi
 
 "$STABILITY_PYTHON" -m qa_cycle_detector.stability_cli \
@@ -51,7 +57,5 @@ fi
   --max-examples "${STABILITY_MAX_EXAMPLES:-20}" \
   --rank "${STABILITY_RANK:-3}" \
   --directions "${STABILITY_DIRECTIONS:-4}" \
-  --amplitudes 0.005 0.02 0.05 \
   --baseline-samples 4 \
-  --max-new-tokens "${STABILITY_MAX_NEW_TOKENS:-24}" \
   "${EXTRA_ARGS[@]}"
