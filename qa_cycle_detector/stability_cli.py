@@ -39,14 +39,17 @@ def unlabeled_rows(rows, maximum):
         raise ValueError("max-examples must be positive")
     selected, seen = [], set()
     for row in rows[:maximum]:
-        if any(not isinstance(row.get(k), str) or not row[k].strip() for k in ("question", "answer")):
-            raise ValueError("each selected row needs nonempty question and supplied answer strings")
-        key = (row["question"], row["answer"])
+        if not isinstance(row.get("question"), str) or not row["question"].strip():
+            raise ValueError("each selected row needs a nonempty question string")
+        if "answer" in row and (not isinstance(row["answer"], str) or not row["answer"].strip()):
+            raise ValueError("optional supplied answer must be a nonempty string")
+        key = (row["question"], row.get("answer"))
         if key in seen:
             raise ValueError("duplicate question/answer pair in pilot inputs")
         seen.add(key)
         # Whitelist inputs. Labels, grading results, and existing features never enter the pilot.
-        selected.append({"question": row["question"], "answer": row["answer"]} |
+        selected.append({"question": row["question"]} |
+                        ({"answer": row["answer"]} if "answer" in row else {}) |
                         ({"id": row["id"]} if "id" in row else {}))
     if not selected:
         raise ValueError("no pilot examples")
@@ -121,7 +124,7 @@ def cached_generation(path, backend, prompt, config, seed, delta=None, temperatu
 def collect_example(directory, row, backend, config):
     directory.mkdir(parents=True, exist_ok=True)
     views = prompts(row["question"])
-    seed = (config.seed + int(digest({k: row[k] for k in ("question", "answer")})[:8], 16)) % (2 ** 31)
+    seed = (config.seed + int(digest({k: row[k] for k in ("question", "answer") if k in row})[:8], 16)) % (2 ** 31)
     state_path = directory / "states.json"
     if state_path.exists():
         state = read_json(state_path)
@@ -174,16 +177,18 @@ def collect_example(directory, row, backend, config):
 
 def score_example(raw, encoder, config):
     started = time.perf_counter()
-    all_texts = [raw["input"]["answer"], raw["anchor"]["text"]] + [u["text"] for u in raw["units"]]
+    answer = raw["input"].get("answer", raw["anchor"]["text"])
+    answer_source = "supplied" if "answer" in raw["input"] else "generated_anchor"
+    all_texts = [answer, raw["anchor"]["text"]] + [u["text"] for u in raw["units"]]
     unique = list(dict.fromkeys(text for text in all_texts if text.strip()))
-    vectors = np.asarray(encoder.encode(unique), dtype=float)
+    vectors = np.asarray(encoder.encode(unique), dtype=float) if unique else np.empty((0, 1))
     if (vectors.ndim != 2 or len(vectors) != len(unique) or not np.isfinite(vectors).all()
             or (np.linalg.norm(vectors, axis=1) < 1e-12).any()):
         raise ValueError("semantic encoder returned invalid vectors")
     lookup = dict(zip(unique, vectors))
     zero = np.zeros(vectors.shape[1])
     anchor = lookup.get(raw["anchor"]["text"], zero)
-    supplied = lookup[raw["input"]["answer"]]
+    supplied = lookup.get(answer, zero)
 
     def summarize(units):
         texts = [u["text"] for u in units]
@@ -221,6 +226,7 @@ def score_example(raw, encoder, config):
     anchor_similarity = float(similarities_to_target(np.asarray([anchor]), supplied)[0])
     anchor_agreement = anchor_valid and anchor_similarity >= config.equivalence_threshold
     return {"schema": SCHEMA, "input": raw["input"], "anchor": raw["anchor"]["text"],
+            "answer": answer, "answer_source": answer_source,
             "supplied_anchor_similarity": anchor_similarity,
             "supplied_anchor_equivalent": anchor_agreement,
             "supplied_answer_score": corrected if anchor_agreement else None,
@@ -293,7 +299,8 @@ def run_pilot(root, rows, config, settings, backend_factory, encoder_factory):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--input", required=True, help="JSONL or legacy shard directory; correctness fields ignored")
+    parser.add_argument("--input", default=str(Path(__file__).resolve().parents[1] / "data" / "stability_pilot_questions.jsonl"),
+                        help="question-only/QA JSONL or shard directory; defaults to fresh bundled questions")
     parser.add_argument("--run-root", required=True, help="new, separate output directory")
     parser.add_argument("--max-examples", type=int, default=20)
     parser.add_argument("--model", default="Qwen/Qwen2.5-3B-Instruct")

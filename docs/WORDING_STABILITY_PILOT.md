@@ -7,20 +7,24 @@ not a validated hallucination detector or a claim of established novelty.
 
 No correctness labels, classifier training, label-based layer/rank selection, or
 threshold fitting is used. The loader explicitly discards `label`, grading fields,
-legacy features, and sample answers. Only `question`, supplied `answer`, and optional
-`id` are retained. Label changes alone cannot change inputs, seeds, or outputs.
-Questions and supplied answers can come directly from existing feature JSONL files
-or directories containing `shard_*.jsonl`; source files are read only.
+legacy features, and sample answers. Only `question`, optional supplied `answer`,
+and optional `id` are retained. Label changes alone cannot change inputs, seeds,
+or outputs. By default, the pilot uses the new question-only dataset at
+`data/stability_pilot_questions.jsonl` and generates its own answers. It has twenty
+manually composed questions, no reference answers or correctness labels, and no
+dependency on old runs. It is a small convenience set, not a representative or
+graded benchmark. Existing QA JSONL/shard directories remain optional inputs.
 
 ## Simplest Slurm setup
 
 Once the new pilot files are in your cluster checkout, run from that repository:
 
 ```bash
-python scripts/submit_stability.py /path/to/existing-run/features/test
+python scripts/submit_stability.py
 ```
 
-This submits a two-example smoke test. It chooses the existing HaloScope Python
+This submits a two-example smoke test using fresh bundled questions and newly
+generated answers. It chooses the existing HaloScope Python
 environment if available (or the invoking Python), preserves your existing cache
 settings, verifies the model environment and locally cached snapshots, creates a
 unique output directory, and prints the job ID, log command, and result path. It
@@ -29,7 +33,7 @@ does not download models by default. No GPU check is attempted on the login node
 For twenty examples:
 
 ```bash
-python scripts/submit_stability.py /path/to/existing-run/features/test --examples 20
+python scripts/submit_stability.py --examples 20
 ```
 
 Optional overrides, only if your environment needs them:
@@ -56,7 +60,9 @@ loading and GPU compatibility are checked when the job runs.
    (default: the middle block, zero-based). Use anchor-relative displacements to
    obtain an SVD wording basis, default rank 3. Cap rank at numerical rank and
    hidden dimension minus one. Fail explicitly if no basis is identifiable.
-3. Generate an unperturbed greedy anchor answer. Separately sample four answers
+3. Generate an unperturbed greedy anchor answer. When the input contains only a
+   question, this becomes the answer being analyzed (`answer_source=generated_anchor`).
+   No old predictions or answers are required. Separately sample four answers
    with temperature 0.8 as the ordinary sampling-entropy baseline (no top-p filter).
 4. For each of three perturbation amplitudes and four noise directions, generate
    answers under five conditions:
@@ -189,6 +195,10 @@ answer to the question. If that anchor does not match the supplied answer,
 `supplied_answer_score` is null; question-level sensitivity remains available. This
 prevents silently treating stability of a newly generated answer as a score for a
 different answer from an existing run. No answer is regraded or rewritten.
+For question-only inputs, there is no supplied-answer comparison: the generated
+anchor is the target. Output names containing `supplied` are retained for schema
+compatibility and refer to that anchor in this mode; `answer_source` makes this
+explicit. Empty/truncated anchors yield unusable scores, not factual judgments.
 
 ## Output and resume
 

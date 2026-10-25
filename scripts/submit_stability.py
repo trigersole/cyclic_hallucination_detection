@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Submit the isolated Slurm pilot: python scripts/submit_stability.py INPUT."""
+"""Submit a fresh Slurm pilot: python scripts/submit_stability.py [INPUT]."""
 from __future__ import annotations
 
 import argparse
@@ -18,7 +18,8 @@ REPOSITORY = Path(__file__).resolve().parents[1]
 
 def parser():
     result = argparse.ArgumentParser(description=__doc__)
-    result.add_argument("input", help="existing QA JSONL or feature-shard directory")
+    result.add_argument("input", nargs="?", default=str(REPOSITORY / "data" / "stability_pilot_questions.jsonl"),
+                        help="optional question-only/QA JSONL; defaults to the new bundled question set")
     result.add_argument("--examples", type=int, default=2, help="default: 2-example smoke test; use 20 for pilot")
     result.add_argument("--run-root", type=Path, help="optional explicit directory, including for resuming")
     result.add_argument("--model", help="default: STABILITY_MODEL, MODEL_ID, or existing Llama-2 model")

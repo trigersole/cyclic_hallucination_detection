@@ -9,6 +9,15 @@ import pytest
 from scripts import submit_stability
 
 
+def test_no_input_argument_selects_fresh_unlabeled_questions():
+    from qa_cycle_detector.stability_cli import selected_inputs
+    args = submit_stability.parser().parse_args([])
+    rows = selected_inputs(args.input, 20)
+    assert len(rows) == 20
+    assert len({row["id"] for row in rows}) == 20
+    assert all(set(row) == {"id", "question"} for row in rows)
+
+
 def test_plan_reuses_environment_and_only_requires_input(tmp_path):
     source = tmp_path / "input.jsonl"
     source.write_text('{}\n', encoding="utf-8")

@@ -12,7 +12,7 @@
 set -euo pipefail
 
 cd "${SLURM_SUBMIT_DIR}"
-STABILITY_INPUT=${STABILITY_INPUT:?Set STABILITY_INPUT to existing QA JSONL or a feature-shard directory}
+STABILITY_INPUT=${STABILITY_INPUT:-${SLURM_SUBMIT_DIR}/data/stability_pilot_questions.jsonl}
 STABILITY_RUN_ROOT=${STABILITY_RUN_ROOT:?Set STABILITY_RUN_ROOT to a new separate directory}
 STABILITY_MODEL=${STABILITY_MODEL:-meta-llama/Llama-2-7b-chat-hf}
 STABILITY_EMBEDDING_MODEL=${STABILITY_EMBEDDING_MODEL:-sentence-transformers/all-mpnet-base-v2}

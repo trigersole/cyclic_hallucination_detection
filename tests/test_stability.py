@@ -78,6 +78,32 @@ def test_pilot_streams_only_selected_prefix_and_ignores_labels(tmp_path):
         selected_inputs(tmp_path, 2)
 
 
+def test_fresh_question_only_run_generates_its_own_answer(tmp_path):
+    question = {"id": "fresh", "question": "Which insects live in a vespiary?", "label": 1}
+    rows = unlabeled_rows([question], 1)
+    assert rows == [{"id": "fresh", "question": question["question"]}]
+    report = run_pilot(tmp_path, rows, small_config(), {"model": "fake"}, FakeBackend, FakeEncoder)
+    score = read_json(tmp_path / "examples" / "00000" / "scores.json")
+    assert score["answer"] == "Wasps"
+    assert score["answer_source"] == "generated_anchor"
+    assert score["supplied_answer_score"] is not None
+    assert report["supplied_anchor_disagreements"] == 0
+
+
+def test_empty_outputs_in_question_only_run_are_unusable_not_an_error(tmp_path):
+    raw = collect_example(tmp_path, {"question": "An example question?"}, FakeBackend(), small_config())
+    raw["anchor"]["text"] = ""
+    for unit in raw["units"]:
+        unit["text"] = ""
+    class NoEncoderNeeded:
+        def encode(self, texts):
+            raise AssertionError("there is no nonempty text to encode")
+    score = score_example(raw, NoEncoderNeeded(), small_config())
+    assert score["answer"] == ""
+    assert score["scores"]["wording_corrected"] is None
+    assert score["supplied_answer_score"] is None
+
+
 def test_subspace_and_perturbations_have_matched_norms_and_dimensions():
     backend = FakeBackend()
     states = [backend.capture(p) for p in prompts(source()["question"])]
